@@ -85,6 +85,8 @@ Running unverified scripts (like .sh, .ps1, .bat, or .py files) gives third-part
 - Delete or permanently corrupt your files.
 - Silently compromise your entire home network.
 
+> RetroSync is currently in an alpha testing state. While the scripts are available for use and review, expect bugs, edge cases, and potential instability. Use at your own risk, and please back up your data before testing!
+
 ### Linux (RetroDECK)
 
 ```bash
