@@ -6,7 +6,7 @@
 # locations" mode where the user enters absolute paths manually for each
 # thing to sync (works with any frontend or no frontend at all).
 # Project: https://github.com/<owner>/retrosync
-# License: MIT
+# License: GPL-3.0
 
 # POSIX-safe sanity check: the script uses bashisms (arrays, [[ ]], BASH_REMATCH,
 # `set -o pipefail`, etc.) throughout. If invoked via `sh retrosync-setup.sh` on

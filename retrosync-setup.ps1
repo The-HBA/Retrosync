@@ -8,7 +8,7 @@
     user enters absolute paths manually for each thing to sync (works with
     any frontend or no frontend at all).
     Project: https://github.com/<owner>/retrosync
-    License: MIT
+    License: GPL-3.0
 
 .PARAMETER DryRun
     Print every action without making API calls or filesystem changes.
@@ -685,7 +685,7 @@ function Step-FrontendSelection {
     $choice = Read-Prompt "Choice" "1"
     switch ($choice) {
         '1' { $Script:Frontend = 'retrobat'; Find-RetrobatBase }
-        '2' { $Script:Frontend = 'custom';   Collect-CustomPaths }
+        '2' { $Script:Frontend = 'custom';   Read-CustomPaths }
         default {
             Write-Err "Invalid choice: $choice."
             exit 1
@@ -713,7 +713,7 @@ function Find-RetrobatBase {
 # then for an absolute path per known emulator's save folder (blank = skip).
 # Populates the $Script:Custom* state used by the scope builder and saves
 # picker.
-function Collect-CustomPaths {
+function Read-CustomPaths {
     Write-Host ""
     Write-Host "Custom locations mode."
     Write-Host ""
@@ -2053,7 +2053,7 @@ function Write-Summary {
     Write-Hr
 }
 
-function Build-ProfileObject {
+function New-ProfileObject {
     $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $hostname = [System.Environment]::MachineName
 
@@ -2401,7 +2401,7 @@ function Invoke-Main {
     Step-ApplyAll
 
     if ($Script:AppliedFolders.Count -gt 0) {
-        Save-Profile (Build-ProfileObject)
+        Save-Profile (New-ProfileObject)
     } else {
         Write-Warn "No folders were configured - profile not saved."
     }
