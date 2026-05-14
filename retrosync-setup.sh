@@ -2,7 +2,9 @@
 # retrosync-setup.sh — Configure Syncthing for retro-gaming sync between a
 # client device and a central NAS hub via the Syncthing REST API.
 #
-# v1 supports: RetroDECK on Linux (including SteamOS / Bazzite).
+# Supports: RetroDECK on Linux (including SteamOS / Bazzite), and a "custom
+# locations" mode where the user enters absolute paths manually for each
+# thing to sync (works with any frontend or no frontend at all).
 # Project: https://github.com/<owner>/retrosync
 # License: MIT
 
@@ -22,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.2.0"
+readonly RETROSYNC_VERSION="0.3.0"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -156,6 +158,25 @@ RETRODECK_SAVE_LOCATIONS=(
     "Ruffle (Flash)|flash|saves/flash/ruffle|data/ruffle|Ruffle saved games"
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. Custom-mode state — paths supplied by the user instead of a frontend layout
+# ─────────────────────────────────────────────────────────────────────────────
+# In custom mode the user enters an absolute path for each thing they want to
+# sync (blank = skip). Scope keys `roms` and `bios` stay bare so a custom-mode
+# device can share those Syncthing folders with a RetroDECK device on the same
+# NAS. States/gamelists/media use `custom-*` keys because their on-disk layout
+# is unknown and almost certainly won't match RetroDECK's. Per-emulator saves
+# reuse the same `saves/<console_id>` NAS subpath convention as RetroDECK so
+# format-compatible save folders (PCSX2 memcards, DuckStation memcards, etc.)
+# can cross-sync between custom and RetroDECK devices.
+CUSTOM_ROMS_PATH=""
+CUSTOM_BIOS_PATH=""
+CUSTOM_STATES_PATH=""
+CUSTOM_GAMELISTS_PATH=""
+CUSTOM_MEDIA_PATH=""
+# Per-emulator saves in custom mode. Each entry: "console_id|absolute_path".
+CUSTOM_SAVE_PATHS=()
+
 # RetroArch save subdirectory names (under retroarch/saves/) by core.
 # These are the directory names RetroArch creates per core for SRAM/memory cards.
 # Source: perplexity research, RETROARCH CORE NAME REFERENCE.
@@ -286,19 +307,22 @@ prompt_secret() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API key storage (plaintext | libsecret | prompt)
+# API key storage (libsecret | openssl-machine | plaintext | prompt)
 #
-# - plaintext: api_key is the raw key in profile.json. Simple, no extra deps.
-#              The file is chmod 600 on save so other Linux accounts can't
-#              read it. Real risk is accidental exposure (cloud sync, screen-
-#              shot, git commit).
-# - libsecret: api_key is empty in profile.json; the key lives in the running
-#              desktop's keyring (GNOME Keyring, KWallet, etc.) addressed by
-#              service=retrosync key=api-key. Sharing profile.json doesn't
-#              expose the key. Requires `secret-tool` and a running keyring
-#              agent — won't work in headless / no-DE environments.
-# - prompt:    nothing stored. We ask for the key on every run. Most secure,
-#              least convenient.
+# Linux equivalents to Windows DPAPI for "encrypt at rest, decryptable only
+# by me on this machine":
+#
+# - libsecret:       Encrypted in the desktop's keyring (GNOME Keyring,
+#                    KWallet, etc.) via `secret-tool`. Strongest option but
+#                    needs a running keyring agent — fails on headless boxes
+#                    and Steam Deck Game Mode.
+# - openssl-machine: Encrypted with AES-256-CBC using a key derived from
+#                    /etc/machine-id + the current UID. Same "this user on
+#                    this machine only" guarantee as Windows DPAPI. Works on
+#                    any system with openssl + a machine-id file, which is
+#                    basically every modern Linux.
+# - plaintext:       Raw key in profile.json. File is chmod 600 on save.
+# - prompt:          Nothing stored. Re-prompted every run.
 # ─────────────────────────────────────────────────────────────────────────────
 
 libsecret_available() {
@@ -314,57 +338,110 @@ libsecret_available() {
     [[ $rc -le 1 ]]
 }
 
+openssl_machine_key() {
+    # Derive a 64-char hex key from the machine-id + current UID. Same idea
+    # as Windows DPAPI: the key is bound to "this user on this machine."
+    # /etc/machine-id is set by systemd at install time; the dbus path is a
+    # legacy fallback some distros still populate.
+    local machine_id=""
+    if [[ -r /etc/machine-id ]]; then
+        machine_id="$(cat /etc/machine-id 2>/dev/null)"
+    elif [[ -r /var/lib/dbus/machine-id ]]; then
+        machine_id="$(cat /var/lib/dbus/machine-id 2>/dev/null)"
+    fi
+    [[ -z "$machine_id" ]] && return 1
+    printf '%s|%s|retrosync' "$machine_id" "$(id -u)" \
+        | sha256sum | awk '{print $1}'
+}
+
+openssl_machine_available() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl_machine_key >/dev/null 2>&1
+}
+
+openssl_machine_encrypt() {
+    local plaintext="$1" key
+    key="$(openssl_machine_key)" || return 1
+    # -A: base64 without line wrapping; safe for storage in a single JSON field.
+    printf '%s' "$plaintext" \
+        | openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -pass pass:"$key" -base64 -A 2>/dev/null
+}
+
+openssl_machine_decrypt() {
+    local ciphertext="$1" key
+    key="$(openssl_machine_key)" || return 1
+    printf '%s' "$ciphertext" \
+        | openssl enc -aes-256-cbc -d -salt -pbkdf2 \
+            -pass pass:"$key" -base64 -A 2>/dev/null
+}
+
 read_api_key_storage_mode() {
-    # Print the menu to stderr (so the menu doesn't get captured by $(...)),
-    # echo the chosen mode to stdout. Same pattern as choose_direction_for.
-    local has_libsecret=0
+    # Build the storage-mode menu dynamically. Stronger options are listed
+    # first so the default ("1") is whatever encryption is available. The
+    # menu prints to stderr — only the chosen mode string goes to stdout,
+    # since this function is called via $(...) and we don't want the menu
+    # text captured into the return value.
+    local has_libsecret=0 has_openssl=0
     libsecret_available && has_libsecret=1
+    openssl_machine_available && has_openssl=1
+
+    local -a modes labels descs
+    if (( has_libsecret == 1 )); then
+        modes+=("libsecret")
+        labels+=("System keyring (libsecret)")
+        descs+=("Encrypted by your desktop's keyring (GNOME Keyring,
+        KWallet, etc.). profile.json holds no key material.
+        Strongest option, but needs a desktop session.")
+    fi
+    if (( has_openssl == 1 )); then
+        modes+=("openssl-machine")
+        labels+=("Encrypted with machine-bound key (openssl)")
+        descs+=("AES-256 encrypted using a key derived from your
+        machine-id and user UID. Decryptable only by you on
+        this machine. No desktop session needed; works on
+        headless boxes and Steam Deck Game Mode.")
+    fi
+    modes+=("plaintext")
+    labels+=("Plaintext in profile.json")
+    descs+=("Simple. The file will be chmod 600 (your user only).
+        Risk: if you upload, commit, or share the file by
+        accident, the key is visible.")
+    modes+=("prompt")
+    labels+=("Don't store - prompt on every run")
+    descs+=("Most secure. Re-typed each time.")
 
     {
         echo
         echo "How should the NAS Syncthing API key be stored?"
         echo
-        echo "    [1] Plaintext in profile.json"
-        echo "        Simple. The file will be chmod 600 (your user only)."
-        echo "        Risk: if you upload, commit, or share the file by"
-        echo "        accident, the key is visible."
-        echo
-        if [[ $has_libsecret -eq 1 ]]; then
-            echo "    [2] System keyring (libsecret - recommended)"
-            echo "        Encrypted by your desktop's keyring (GNOME Keyring,"
-            echo "        KWallet, etc.). profile.json holds no key material."
+        local i
+        for i in "${!modes[@]}"; do
+            local n=$((i+1))
+            local recommended=""
+            (( i == 0 )) && recommended=" (recommended)"
+            printf '    [%d] %s%s\n' "$n" "${labels[$i]}" "$recommended"
+            # Print the (multi-line) description with indentation
+            printf '        %s\n' "${descs[$i]}" | sed '2,$s/^        //'
             echo
-            echo "    [3] Don't store - prompt on every run"
-            echo "        Most secure. Re-typed each time."
-        else
-            echo "    [2] Don't store - prompt on every run"
-            echo "        Most secure. Re-typed each time."
+        done
+        if (( has_libsecret == 0 )); then
+            echo "  (libsecret/system-keyring option is hidden because either"
+            echo "   'secret-tool' isn't installed or no keyring agent is"
+            echo "   running. Install libsecret-tools / libsecret on your"
+            echo "   distro to enable that option.)"
             echo
-            echo "  Note: 'libsecret / system keyring' is unavailable on this"
-            echo "        machine. Install 'secret-tool' (libsecret-tools on"
-            echo "        Debian/Ubuntu, libsecret on Arch) and run inside a"
-            echo "        desktop session if you want that option."
         fi
-        echo
     } >&2
 
     while true; do
         local choice
-        choice="$(prompt "Choice" "$([[ $has_libsecret -eq 1 ]] && echo 2 || echo 1)")"
-        if [[ $has_libsecret -eq 1 ]]; then
-            case "$choice" in
-                1) echo "plaintext"; return ;;
-                2) echo "libsecret"; return ;;
-                3) echo "prompt";    return ;;
-                *) warn "Pick 1, 2, or 3." ;;
-            esac
-        else
-            case "$choice" in
-                1) echo "plaintext"; return ;;
-                2) echo "prompt";    return ;;
-                *) warn "Pick 1 or 2." ;;
-            esac
+        choice="$(prompt "Choice" "1")"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#modes[@]} )); then
+            echo "${modes[$((choice-1))]}"
+            return
         fi
+        warn "Pick a number between 1 and ${#modes[@]}."
     done
 }
 
@@ -391,6 +468,15 @@ protect_api_key_for_storage() {
                 echo "$key"
             fi
             ;;
+        openssl-machine)
+            local enc
+            if enc="$(openssl_machine_encrypt "$key")" && [[ -n "$enc" ]]; then
+                echo "$enc"
+            else
+                warn "Machine-key encryption failed; falling back to plaintext."
+                echo "$key"
+            fi
+            ;;
         *)
             echo "$key"
             ;;
@@ -414,6 +500,16 @@ unprotect_api_key_from_storage() {
             else
                 warn "Stored key not found in keyring (was the keyring agent" >&2
                 warn "running, or did the entry get cleared?). Re-prompting." >&2
+                key="$(prompt_secret "NAS Syncthing API key")"
+                echo "$key"
+            fi
+            ;;
+        openssl-machine)
+            if key="$(openssl_machine_decrypt "$stored")" && [[ -n "$key" ]]; then
+                echo "$key"
+            else
+                warn "Couldn't decrypt the stored API key (was the profile" >&2
+                warn "copied from another user or machine?). Re-prompting." >&2
                 key="$(prompt_secret "NAS Syncthing API key")"
                 echo "$key"
             fi
@@ -555,16 +651,22 @@ EOF
     fi
 }
 
-extract_local_api_key() {
-    # Try each candidate path; echo the apikey on stdout, return 0 if found.
-    local cfg key
+extract_local_syncthing_info() {
+    # Walk SYNCTHING_CONFIG_CANDIDATES; on the first readable config.xml,
+    # extract the API key and the GUI <address> (port could be customised).
+    # Echoes "<api_key>|<gui_address>" on success, returns 0.
+    # Returns 1 if no config was found.
+    local cfg key addr
     for cfg in "${SYNCTHING_CONFIG_CANDIDATES[@]}"; do
         if [[ -r "$cfg" ]]; then
             verbose "Reading Syncthing config: $cfg"
-            # POSIX-safe extract: -P uses Perl regex.
             key="$(grep -oP '(?<=<apikey>)[^<]+' "$cfg" 2>/dev/null | head -n1 || true)"
+            # Scope the <address> grep to the <gui>...</gui> block, since the
+            # config has other <address> elements (listen addresses, etc.).
+            addr="$(awk '/<gui[ >]/,/<\/gui>/' "$cfg" 2>/dev/null \
+                | grep -oP '(?<=<address>)[^<]+' | head -n1 || true)"
             if [[ -n "$key" ]]; then
-                echo "$key"
+                echo "${key}|${addr}"
                 return 0
             fi
         fi
@@ -572,35 +674,96 @@ extract_local_api_key() {
     return 1
 }
 
+prompt_local_syncthing_manual() {
+    # Fallback when auto-detect can't find config.xml. Asks for URL + API
+    # key directly. Used for Flatpak / portable / custom-port installs.
+    echo
+    echo "You can still proceed by entering the connection details manually."
+    echo "Open Syncthing's Web UI (system tray icon or however you launch it)"
+    echo "and grab the address bar's URL + Actions -> Settings -> API Key."
+    echo
+
+    local manual_url
+    manual_url="$(prompt "Local Syncthing Web UI address" "localhost:8384")"
+    if [[ "$manual_url" =~ ^https?:// ]]; then
+        SYNCTHING_LOCAL_URL="${manual_url%/}/rest"
+    else
+        SYNCTHING_LOCAL_URL="http://${manual_url%/}/rest"
+    fi
+
+    SYNCTHING_LOCAL_KEY="$(prompt_secret "Local Syncthing API key")"
+    if [[ -z "$SYNCTHING_LOCAL_KEY" ]]; then
+        fatal "API key required. Aborting."
+    fi
+}
+
 preflight_local_syncthing() {
     info "Checking local Syncthing…"
-    SYNCTHING_LOCAL_URL="$SYNCTHING_LOCAL_DEFAULT/rest"
+    SYNCTHING_LOCAL_URL=""
+    SYNCTHING_LOCAL_KEY=""
 
-    if ! SYNCTHING_LOCAL_KEY="$(extract_local_api_key)"; then
-        err "Could not find Syncthing config.xml in:"
+    # Try to read config.xml from the standard XDG paths.
+    local info_str
+    if info_str="$(extract_local_syncthing_info)"; then
+        local addr
+        SYNCTHING_LOCAL_KEY="${info_str%%|*}"
+        addr="${info_str#*|}"
+        if [[ -n "$addr" ]]; then
+            # Both 0.0.0.0 and the explicit 127.0.0.1 are listen addresses;
+            # for talking to the local API "localhost" is friendlier.
+            addr="${addr//0.0.0.0/localhost}"
+            SYNCTHING_LOCAL_URL="http://${addr}/rest"
+        else
+            SYNCTHING_LOCAL_URL="${SYNCTHING_LOCAL_DEFAULT}/rest"
+        fi
+    else
+        # Auto-detect failed — fall back to manual entry instead of
+        # hardcoding more paths (Flatpak sandboxes, AppImage spots, etc.).
+        warn "Could not find Syncthing config.xml in:"
         local p
         for p in "${SYNCTHING_CONFIG_CANDIDATES[@]}"; do
-            err "  $p"
+            warn "  - $p"
         done
-        cat >&2 <<EOF
-
-Syncthing must be installed and started at least once on this device
-before running ${RETROSYNC_NAME}. Start it with:
-
-  systemctl --user enable --now syncthing.service
-
-Then re-run this script.
-EOF
-        exit 1
+        echo
+        echo "Common reasons:"
+        echo "  - Syncthing hasn't been started yet on this machine (the"
+        echo "    config.xml is created on first launch)."
+        echo "  - You're using a Flatpak / AppImage / portable install whose"
+        echo "    config lives elsewhere (e.g. Syncthingy keeps it inside"
+        echo "    ~/.var/app/com.github.zocker_160.SyncThingy/...)."
+        echo "  - The GUI port was changed from 8384."
+        prompt_local_syncthing_manual
     fi
 
-    # Ping the local API to confirm it's reachable AND the key works.
-    if ! st_get local "/system/ping" >/dev/null 2>&1; then
-        fatal "Local Syncthing is not responding at ${SYNCTHING_LOCAL_DEFAULT}.
-Make sure it's running:  systemctl --user status syncthing.service"
-    fi
-
-    success "Local Syncthing reachable at ${SYNCTHING_LOCAL_DEFAULT}"
+    # Verify connectivity. On failure, let the user fix the URL or key
+    # without restarting the script.
+    while true; do
+        if st_get local "/system/ping" >/dev/null 2>&1; then
+            success "Local Syncthing reachable at ${SYNCTHING_LOCAL_URL%/rest}"
+            return 0
+        fi
+        echo
+        warn "Local Syncthing not responding at ${SYNCTHING_LOCAL_URL%/rest}"
+        echo "  Check that:"
+        echo "    - Syncthing is running (system tray icon, or"
+        echo "      'systemctl --user status syncthing.service')"
+        echo "    - The URL above matches the address shown in Syncthing's Web UI"
+        echo "    - The API key matches Web UI -> Actions -> Settings -> API Key"
+        echo
+        if ! prompt_yn "Retry with different connection details?" "y"; then
+            fatal "Cancelled."
+        fi
+        local retry_url
+        retry_url="$(prompt "Local Syncthing Web UI address" "${SYNCTHING_LOCAL_URL%/rest}")"
+        if [[ "$retry_url" =~ ^https?:// ]]; then
+            SYNCTHING_LOCAL_URL="${retry_url%/}/rest"
+        else
+            SYNCTHING_LOCAL_URL="http://${retry_url%/}/rest"
+        fi
+        if prompt_yn "Re-enter the API key too?" "n"; then
+            SYNCTHING_LOCAL_KEY="$(prompt_secret "Local Syncthing API key")"
+        fi
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -705,7 +868,12 @@ step_frontend_selection() {
     if [[ -n "${EXISTING_PROFILE:-}" ]]; then
         FRONTEND="$(echo "$EXISTING_PROFILE" | jq -r '.frontend')"
         FRONTEND_BASE="$(echo "$EXISTING_PROFILE" | jq -r '.frontend_base_path')"
-        info "Using saved frontend: ${FRONTEND} at ${FRONTEND_BASE}"
+        if [[ "$FRONTEND" == "custom" ]]; then
+            info "Using saved frontend: custom locations"
+            restore_custom_state_from_profile
+        else
+            info "Using saved frontend: ${FRONTEND} at ${FRONTEND_BASE}"
+        fi
         return 0
     fi
 
@@ -713,19 +881,20 @@ step_frontend_selection() {
     echo "Which retro gaming frontend are you using on this device?"
     echo
     echo "    [1] RetroDECK (Linux Flatpak)"
+    echo "    [2] Custom locations  (manually enter the path for each thing to sync)"
     echo
-    echo "  Note: EmuDeck and standalone ES-DE support might be added in"
-    echo "  future versions. RetroBat users should use retrosync-setup.ps1"
-    echo "  on Windows."
+    echo "  Pick [2] if you run any non-RetroDECK frontend on Linux (EmuDeck,"
+    echo "  standalone ES-DE, Lutris, plain RetroArch, custom layouts) or if"
+    echo "  your save folders live somewhere other than the default RetroDECK"
+    echo "  layout. RetroBat users should use retrosync-setup.ps1 on Windows."
     echo
     local choice
     choice="$(prompt "Choice" "1")"
     case "$choice" in
-        1) FRONTEND="retrodeck" ;;
-        *) fatal "Invalid choice: $choice. Only RetroDECK is supported in v${RETROSYNC_VERSION}." ;;
+        1) FRONTEND="retrodeck"; detect_retrodeck_base ;;
+        2) FRONTEND="custom";    collect_custom_paths   ;;
+        *) fatal "Invalid choice: $choice." ;;
     esac
-
-    detect_retrodeck_base
 }
 
 # Detect the user-data root for RetroDECK by:
@@ -788,6 +957,102 @@ detect_retrodeck_base() {
         fi
     fi
     success "Using RetroDECK base: $FRONTEND_BASE"
+}
+
+# Custom mode: ask the user for an absolute path per scope (blank = skip),
+# then for an absolute path per known emulator's save folder (blank = skip).
+# Populates the CUSTOM_*_PATH vars and CUSTOM_SAVE_PATHS used by the scope
+# builder and saves picker.
+collect_custom_paths() {
+    echo
+    echo "Custom locations mode."
+    echo
+    echo "Enter the absolute path for each thing you want to sync."
+    echo "Leave a prompt blank to skip that entry. Examples:"
+    echo "  /mnt/games/roms"
+    echo "  $HOME/emulation/bios"
+    echo
+    info "Each path can point to anywhere — local drive, external drive,"
+    info "network mount. Only entries you fill in will be synced."
+    echo
+
+    # Custom mode has no single root, so FRONTEND_BASE stays empty. The scope
+    # builder emits absolute paths in the local_sub field and step_apply_all
+    # detects that and skips the FRONTEND_BASE join.
+    FRONTEND_BASE=""
+
+    CUSTOM_ROMS_PATH="$(prompt      "Path to ROMs folder (blank to skip)"             "")"
+    CUSTOM_BIOS_PATH="$(prompt      "Path to BIOS folder (blank to skip)"             "")"
+    CUSTOM_STATES_PATH="$(prompt    "Path to save states folder (blank to skip)"      "")"
+    CUSTOM_GAMELISTS_PATH="$(prompt "Path to ES-DE gamelists folder (blank to skip)"  "")"
+    CUSTOM_MEDIA_PATH="$(prompt     "Path to ES-DE downloaded media (blank to skip)"  "")"
+
+    # Strip trailing slashes so subsequent path joins don't end up with //.
+    CUSTOM_ROMS_PATH="${CUSTOM_ROMS_PATH%/}"
+    CUSTOM_BIOS_PATH="${CUSTOM_BIOS_PATH%/}"
+    CUSTOM_STATES_PATH="${CUSTOM_STATES_PATH%/}"
+    CUSTOM_GAMELISTS_PATH="${CUSTOM_GAMELISTS_PATH%/}"
+    CUSTOM_MEDIA_PATH="${CUSTOM_MEDIA_PATH%/}"
+
+    echo
+    echo "Per-emulator save folders."
+    echo "Enter the absolute path to each emulator's save directory."
+    echo "Blank = skip that emulator."
+    echo
+
+    local entry label console_id _primary _sandbox _notes path
+    for entry in "${RETRODECK_SAVE_LOCATIONS[@]}"; do
+        IFS='|' read -r label console_id _primary _sandbox _notes <<< "$entry"
+        path="$(prompt "  ${label}" "")"
+        path="${path%/}"
+        if [[ -n "$path" ]]; then
+            CUSTOM_SAVE_PATHS+=("${console_id}|${path}")
+        fi
+    done
+
+    local count=0 var
+    for var in "$CUSTOM_ROMS_PATH" "$CUSTOM_BIOS_PATH" "$CUSTOM_STATES_PATH" \
+               "$CUSTOM_GAMELISTS_PATH" "$CUSTOM_MEDIA_PATH"; do
+        [[ -n "$var" ]] && count=$((count + 1))
+    done
+    count=$((count + ${#CUSTOM_SAVE_PATHS[@]}))
+
+    if (( count == 0 )); then
+        fatal "No paths entered — nothing to sync. Re-run and supply at least one path."
+    fi
+
+    echo
+    success "Collected ${count} custom path(s)."
+}
+
+# Re-run with FRONTEND=custom: rebuild CUSTOM_* state from the saved
+# folders[] so the rest of the flow doesn't re-prompt for paths.
+restore_custom_state_from_profile() {
+    local saved_user folders row id lp key console_id
+    saved_user="$(echo "$EXISTING_PROFILE" | jq -r '.username // ""')"
+    folders="$(echo "$EXISTING_PROFILE" | jq -c '.folders // []')"
+
+    while IFS= read -r row; do
+        id="$(echo "$row" | jq -r '.id')"
+        lp="$(echo "$row" | jq -r '.local_path')"
+        # Strip the universal "retrosync-" prefix.
+        key="${id#${FOLDER_ID_PREFIX}-}"
+        # Multi-user profiles also have the username prefix; drop that too.
+        if [[ -n "$saved_user" ]] && [[ "$key" == "${saved_user}-"* ]]; then
+            key="${key#${saved_user}-}"
+        fi
+        case "$key" in
+            roms)             CUSTOM_ROMS_PATH="$lp" ;;
+            bios)             CUSTOM_BIOS_PATH="$lp" ;;
+            custom-states)    CUSTOM_STATES_PATH="$lp" ;;
+            custom-gamelists) CUSTOM_GAMELISTS_PATH="$lp" ;;
+            custom-media)     CUSTOM_MEDIA_PATH="$lp" ;;
+            save-*)
+                console_id="${key#save-}"
+                CUSTOM_SAVE_PATHS+=("${console_id}|${lp}")
+                ;;
+        esac
+    done < <(echo "$folders" | jq -c '.[]')
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -951,10 +1216,11 @@ step_nas_connection() {
 
         local mode_label
         case "$saved_mode" in
-            plaintext) mode_label="plaintext in profile" ;;
-            libsecret) mode_label="system keyring (libsecret)" ;;
-            prompt)    mode_label="re-prompted just now" ;;
-            *)         mode_label="$saved_mode" ;;
+            plaintext)       mode_label="plaintext in profile" ;;
+            libsecret)       mode_label="system keyring (libsecret)" ;;
+            openssl-machine) mode_label="machine-bound encrypted (openssl)" ;;
+            prompt)          mode_label="re-prompted just now" ;;
+            *)               mode_label="$saved_mode" ;;
         esac
         if [[ -n "$SYNCTHING_NAS_URL" ]] && [[ -n "$SYNCTHING_NAS_KEY" ]]; then
             info "Using saved NAS connection: ${SYNCTHING_NAS_URL}"
@@ -1222,12 +1488,39 @@ pair_devices() {
 SYNC_SCOPE_DEFINITIONS=()
 
 build_sync_scope_definitions() {
+    # Folder keys: roms / bios stay bare so a RetroBat and a RetroDECK device
+    # pointing at the same NAS share the same Syncthing folder ID. The
+    # frontend-specific scopes use rd-* prefixed keys here; the PowerShell
+    # script uses rb-* for the equivalent RetroBat scopes. Different keys
+    # means different Syncthing folder IDs, so a cross-frontend setup just
+    # doesn't try to share these structurally-incompatible scopes
+    # (RetroDECK's states/ contains every emulator's states while RetroBat's
+    # RetroArch-only states folder is a subset; RetroDECK splits gamelists
+    # and downloaded_media into separate dirs while RetroBat keeps them
+    # combined under .emulationstation/).
+    #
+    # Same-frontend (RetroDECK<->RetroDECK) sync is unaffected since both
+    # ends use the same prefixed keys.
+    if [[ "$FRONTEND" == "custom" ]]; then
+        # Custom mode: local_sub is the user-supplied absolute path. Only
+        # include scopes the user actually entered a path for. step_apply_all
+        # detects the absolute path (starts with /) and skips the
+        # FRONTEND_BASE join.
+        SYNC_SCOPE_DEFINITIONS=()
+        [[ -n "$CUSTOM_ROMS_PATH"      ]] && SYNC_SCOPE_DEFINITIONS+=("roms|ROMs|${CUSTOM_ROMS_PATH}|roms")
+        [[ -n "$CUSTOM_BIOS_PATH"      ]] && SYNC_SCOPE_DEFINITIONS+=("bios|BIOS|${CUSTOM_BIOS_PATH}|bios")
+        [[ -n "$CUSTOM_STATES_PATH"    ]] && SYNC_SCOPE_DEFINITIONS+=("custom-states|Save states (custom)|${CUSTOM_STATES_PATH}|states/custom")
+        [[ -n "$CUSTOM_GAMELISTS_PATH" ]] && SYNC_SCOPE_DEFINITIONS+=("custom-gamelists|ES-DE gamelists (custom)|${CUSTOM_GAMELISTS_PATH}|gamelists/custom")
+        [[ -n "$CUSTOM_MEDIA_PATH"     ]] && SYNC_SCOPE_DEFINITIONS+=("custom-media|ES-DE downloaded media (custom)|${CUSTOM_MEDIA_PATH}|media/custom")
+        return 0
+    fi
+
     SYNC_SCOPE_DEFINITIONS=(
         "roms|ROMs|${RD_ROMS_SUB}|roms"
         "bios|BIOS|${RD_BIOS_SUB}|bios"
-        "states|Save states (RetroArch)|${RD_STATES_SUB}|states/retroarch"
-        "gamelists|ES-DE gamelists|${RD_GAMELISTS_SUB}|gamelists"
-        "media|ES-DE downloaded media|${RD_MEDIA_SUB}|downloaded_media"
+        "rd-states|Save states (RetroDECK-only - all emulators)|${RD_STATES_SUB}|states/retrodeck"
+        "rd-gamelists|ES-DE gamelists (RetroDECK-only)|${RD_GAMELISTS_SUB}|gamelists/retrodeck"
+        "rd-media|ES-DE downloaded media (RetroDECK-only)|${RD_MEDIA_SUB}|media/retrodeck"
     )
 }
 
@@ -1237,6 +1530,21 @@ SAVES_SELECTED=0
 
 step_sync_scope() {
     build_sync_scope_definitions
+
+    if [[ "$FRONTEND" == "custom" ]]; then
+        # In custom mode the paths the user entered already declared what to
+        # sync — re-asking "ROMs? y/n" right after they typed the ROMs path
+        # would be confusing. Auto-include every scope with a non-empty path.
+        local entry key
+        for entry in "${SYNC_SCOPE_DEFINITIONS[@]}"; do
+            IFS='|' read -r key _ _ _ <<< "$entry"
+            SELECTED_SCOPES+=("$key")
+        done
+        if (( ${#CUSTOM_SAVE_PATHS[@]} > 0 )); then
+            SAVES_SELECTED=1
+        fi
+        return 0
+    fi
 
     echo
     echo "What would you like to sync?"
@@ -1301,7 +1609,12 @@ step_roms_picker() {
         return 0
     fi
 
-    local roms_dir="${FRONTEND_BASE}/${RD_ROMS_SUB}"
+    local roms_dir
+    if [[ "$FRONTEND" == "custom" ]]; then
+        roms_dir="$CUSTOM_ROMS_PATH"
+    else
+        roms_dir="${FRONTEND_BASE}/${RD_ROMS_SUB}"
+    fi
     if [[ ! -d "$roms_dir" ]]; then
         warn "ROMs directory not found: $roms_dir"
         warn "Skipping per-console picker. All console subdirs will sync once they exist."
@@ -1360,7 +1673,13 @@ step_roms_picker() {
 MEDIA_EXCLUDED=()
 
 step_media_picker() {
-    if ! printf '%s\n' "${SELECTED_SCOPES[@]}" | grep -qx "media"; then
+    # Custom mode doesn't tie media to a RetroDECK-style ROM layout, so the
+    # "limit media to the same consoles you chose for ROMs" filter doesn't
+    # apply — the custom-media folder syncs as-is.
+    if [[ "$FRONTEND" == "custom" ]]; then
+        return 0
+    fi
+    if ! printf '%s\n' "${SELECTED_SCOPES[@]}" | grep -qx "rd-media"; then
         return 0
     fi
 
@@ -1384,6 +1703,39 @@ SELECTED_SAVES=()
 
 step_saves_picker() {
     if [[ $SAVES_SELECTED -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ "$FRONTEND" == "custom" ]]; then
+        # Paths were collected up front. Look up the human label for each
+        # console_id from RETRODECK_SAVE_LOCATIONS, then push straight into
+        # SELECTED_SAVES with the standard NAS subpath convention.
+        local entry console_id path label r r_label r_console nas_sub
+        for entry in "${CUSTOM_SAVE_PATHS[@]}"; do
+            IFS='|' read -r console_id path <<< "$entry"
+            label="$console_id"
+            for r in "${RETRODECK_SAVE_LOCATIONS[@]}"; do
+                IFS='|' read -r r_label r_console _ _ _ <<< "$r"
+                if [[ "$r_console" == "$console_id" ]]; then
+                    label="$r_label"
+                    break
+                fi
+            done
+
+            nas_sub="saves/${console_id}"
+            [[ "$console_id" == "retroarch"   ]] && nas_sub="saves/retroarch"
+            [[ "$console_id" == "ps3-trophy"  ]] && nas_sub="saves/ps3/trophy"
+            [[ "$console_id" == "ps3"         ]] && nas_sub="saves/ps3/savedata"
+
+            if [[ ! -d "$path" ]] && [[ $DRY_RUN -eq 0 ]]; then
+                if ! mkdir -p "$path" 2>/dev/null; then
+                    warn "  Couldn't create $path — skipping ${label}."
+                    continue
+                fi
+            fi
+
+            SELECTED_SAVES+=("${label}|${console_id}|${path}|${nas_sub}")
+        done
         return 0
     fi
 
@@ -2087,17 +2439,24 @@ step_apply_all() {
         printf '%s\n' "${SELECTED_SCOPES[@]}" | grep -qx "$key" || continue
 
         local lp np
-        lp="${FRONTEND_BASE}/${local_sub}"
+        # Custom mode emits absolute paths in the local_sub field — detect
+        # that and skip the FRONTEND_BASE join (which would produce //foo).
+        if [[ "$local_sub" == /* ]]; then
+            lp="$local_sub"
+        else
+            lp="${FRONTEND_BASE}/${local_sub}"
+        fi
         np="${user_root}/${nas_sub}"
 
         local versioning="false"
-        # Save states get versioning, ROMs/BIOS/gamelists/media don't.
-        [[ "$key" == "states" ]] && versioning="true"
+        # Save states get versioning. Match anything containing "states"
+        # so the prefixed keys (rd-states, rb-retroarch-states) still work.
+        [[ "$key" == *"states"* ]] && versioning="true"
 
         local ignores=""
         if [[ "$key" == "roms" ]] && (( ${#ROMS_EXCLUDED[@]} > 0 )); then
             ignores="$(IFS=','; echo "${ROMS_EXCLUDED[*]}")"
-        elif [[ "$key" == "media" ]] && (( ${#MEDIA_EXCLUDED[@]} > 0 )); then
+        elif [[ "$key" == "rd-media" ]] && (( ${#MEDIA_EXCLUDED[@]} > 0 )); then
             ignores="$(IFS=','; echo "${MEDIA_EXCLUDED[*]}")"
         fi
 

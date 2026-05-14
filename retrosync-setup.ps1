@@ -4,7 +4,9 @@
     (running RetroBat) and a central NAS hub via the Syncthing REST API.
 
 .DESCRIPTION
-    v1 supports: RetroBat on Windows.
+    Supports: RetroBat on Windows, and a "custom locations" mode where the
+    user enters absolute paths manually for each thing to sync (works with
+    any frontend or no frontend at all).
     Project: https://github.com/<owner>/retrosync
     License: MIT
 
@@ -43,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.2.0'
+$Script:RetroSyncVersion = '0.3.0'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -133,6 +135,25 @@ $Script:RetrobatSaveLocations = @(
     [PSCustomObject]@{Label='melonDS (NDS)';            ConsoleId='nds';       SubPath='saves\nds\melonds';               Notes='NDS standalone saves'},
     [PSCustomObject]@{Label='Citra (3DS)';              ConsoleId='n3ds';      SubPath='saves\3ds\Citra';                 Notes='3DS Citra saves'}
 )
+
+# -----------------------------------------------------------------------------
+# 4b. Custom-mode state - paths supplied by the user instead of a frontend layout
+# -----------------------------------------------------------------------------
+# In custom mode the user enters an absolute path for each thing they want to
+# sync (blank = skip). Scope keys 'roms' and 'bios' stay bare so a custom-mode
+# device can share those Syncthing folders with a RetroBat device on the same
+# NAS. States/gamelists/media use custom-* keys because their on-disk layout
+# is unknown and almost certainly won't match RetroBat's. Per-emulator saves
+# reuse the same saves\<console_id> NAS subpath convention as RetroBat so
+# format-compatible save folders (PCSX2 memcards, DuckStation memcards, etc.)
+# can cross-sync between custom and RetroBat devices.
+$Script:CustomRomsPath      = ''
+$Script:CustomBiosPath      = ''
+$Script:CustomStatesPath    = ''
+$Script:CustomGamelistsPath = ''
+$Script:CustomMediaPath     = ''
+# Per-emulator saves in custom mode. Array of PSCustomObject {ConsoleId, LocalPath}.
+$Script:CustomSavePaths     = @()
 
 # -----------------------------------------------------------------------------
 # 5. Console metadata - large-rom warnings, save incompatibilities
@@ -368,16 +389,22 @@ function Invoke-SyncthingDelete { param($T,$P,[switch]$Silent) Invoke-SyncthingR
 # 8. Pre-flight checks
 # -----------------------------------------------------------------------------
 
-function Get-LocalApiKey {
+function Get-LocalSyncthingInfoFromConfig {
+    # Walk SyncthingConfigCandidates. On the first readable config.xml,
+    # extract the API key and the GUI <address> (port could be customised).
+    # Returns a hashtable @{ Key=...; Address=... } or $null if no config found.
     foreach ($cfg in $Script:SyncthingConfigCandidates) {
         if (Test-Path -LiteralPath $cfg) {
             Write-Verb "Reading Syncthing config: $cfg"
             try {
                 [xml]$xml = Get-Content -LiteralPath $cfg -ErrorAction Stop
                 $key = $xml.configuration.gui.apikey
-                if ($key) { return $key }
-            }
-            catch {
+                if ($key) {
+                    $addr = $xml.configuration.gui.address
+                    if ($addr -is [array]) { $addr = $addr[0] }
+                    return @{ Key = $key; Address = $addr }
+                }
+            } catch {
                 Write-Verb "  failed to parse: $($_.Exception.Message)"
             }
         }
@@ -385,31 +412,93 @@ function Get-LocalApiKey {
     return $null
 }
 
+function Read-LocalSyncthingManual {
+    # Fallback when auto-detect can't find config.xml. Asks for URL + API
+    # key directly. Used for portable installs / custom ports / whatever.
+    Write-Host ""
+    Write-Host "You can still proceed by entering the connection details manually."
+    Write-Host "Open Syncthing's Web UI (system tray icon or however you launch it)"
+    Write-Host "and grab the URL bar + Actions -> Settings -> API Key."
+    Write-Host ""
+
+    $manualUrl = Read-Prompt "Local Syncthing Web UI address" "localhost:8384"
+    if ($manualUrl -match '^https?://') {
+        $Script:SyncthingLocalUrl = "$($manualUrl.TrimEnd('/'))/rest"
+    } else {
+        $Script:SyncthingLocalUrl = "http://$($manualUrl.TrimEnd('/'))/rest"
+    }
+    $Script:SyncthingLocalKey = Read-PromptSecret "Local Syncthing API key"
+    if ([string]::IsNullOrEmpty($Script:SyncthingLocalKey)) {
+        Write-Err "API key required. Aborting."
+        exit 1
+    }
+}
+
 function Test-LocalSyncthing {
     Write-Info "Checking local Syncthing..."
-    $Script:SyncthingLocalUrl = "$Script:SyncthingLocalDefault/rest"
-    $Script:SyncthingLocalKey = Get-LocalApiKey
+    $Script:SyncthingLocalUrl = $null
+    $Script:SyncthingLocalKey = $null
 
-    if (-not $Script:SyncthingLocalKey) {
-        Write-Err "Could not find Syncthing config.xml in:"
-        foreach ($p in $Script:SyncthingConfigCandidates) { Write-Err "  $p" }
+    $info = Get-LocalSyncthingInfoFromConfig
+    if ($info) {
+        $Script:SyncthingLocalKey = $info.Key
+        if ($info.Address) {
+            $cleanAddr = ($info.Address -replace '0\.0\.0\.0','localhost')
+            $Script:SyncthingLocalUrl = "http://$cleanAddr/rest"
+        } else {
+            $Script:SyncthingLocalUrl = "$Script:SyncthingLocalDefault/rest"
+        }
+    } else {
+        # Auto-detect failed - fall back to manual entry rather than
+        # hardcoding more search paths (portable installs etc.).
+        Write-Warn "Could not find Syncthing config.xml in:"
+        foreach ($p in $Script:SyncthingConfigCandidates) { Write-Warn "  - $p" }
         Write-Host ""
-        Write-Host "Syncthing must be installed and started at least once on this device" -ForegroundColor Yellow
-        Write-Host "before running $Script:RetroSyncName." -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "Install:    https://syncthing.net/downloads/" -ForegroundColor Yellow
-        Write-Host "Then start it (it runs in the system tray) and re-run this script." -ForegroundColor Yellow
-        exit 1
+        Write-Host "Common reasons:"
+        Write-Host "  - Syncthing hasn't been started yet on this machine"
+        Write-Host "    (config.xml is created on first launch)."
+        Write-Host "  - You're using a portable install whose config lives"
+        Write-Host "    elsewhere."
+        Write-Host "  - The GUI port was changed from 8384."
+        Read-LocalSyncthingManual
     }
 
-    try {
-        Invoke-SyncthingGet 'local' '/system/ping' | Out-Null
-        Write-Success "Local Syncthing reachable at $Script:SyncthingLocalDefault"
-    }
-    catch {
-        Write-Err "Local Syncthing is not responding at $Script:SyncthingLocalDefault."
-        Write-Err "Make sure it's running (check the system tray)."
-        exit 1
+    # Verify connectivity. On failure, let the user fix the URL or key
+    # without restarting the script.
+    while ($true) {
+        $ok = $false
+        try {
+            Invoke-SyncthingGet 'local' '/system/ping' | Out-Null
+            $ok = $true
+        } catch { $ok = $false }
+
+        if ($ok) {
+            $shownUrl = $Script:SyncthingLocalUrl -replace '/rest$',''
+            Write-Success "Local Syncthing reachable at $shownUrl"
+            return
+        }
+
+        $shownUrl = $Script:SyncthingLocalUrl -replace '/rest$',''
+        Write-Host ""
+        Write-Warn "Local Syncthing not responding at $shownUrl"
+        Write-Host "  Check that:"
+        Write-Host "    - Syncthing is running (system tray icon, or services.msc)"
+        Write-Host "    - The URL above matches the address shown in Syncthing's Web UI"
+        Write-Host "    - The API key matches Web UI -> Actions -> Settings -> API Key"
+        Write-Host ""
+        if (-not (Read-PromptYn "Retry with different connection details?" 'y')) {
+            Write-Err "Cancelled."
+            exit 1
+        }
+        $newUrl = Read-Prompt "Local Syncthing Web UI address" $shownUrl
+        if ($newUrl -match '^https?://') {
+            $Script:SyncthingLocalUrl = "$($newUrl.TrimEnd('/'))/rest"
+        } else {
+            $Script:SyncthingLocalUrl = "http://$($newUrl.TrimEnd('/'))/rest"
+        }
+        if (Read-PromptYn "Re-enter the API key too?" 'n') {
+            $Script:SyncthingLocalKey = Read-PromptSecret "Local Syncthing API key"
+        }
     }
 }
 
@@ -505,7 +594,12 @@ function Step-FrontendSelection {
     if ($Script:ExistingProfile) {
         $Script:Frontend     = $Script:ExistingProfile.frontend
         $Script:FrontendBase = $Script:ExistingProfile.frontend_base_path
-        Write-Info "Using saved frontend: $Script:Frontend at $Script:FrontendBase"
+        if ($Script:Frontend -eq 'custom') {
+            Write-Info "Using saved frontend: custom locations"
+            Restore-CustomStateFromProfile
+        } else {
+            Write-Info "Using saved frontend: $Script:Frontend at $Script:FrontendBase"
+        }
         return
     }
 
@@ -513,18 +607,23 @@ function Step-FrontendSelection {
     Write-Host "Which retro gaming frontend are you using on this device?"
     Write-Host ""
     Write-Host "    [1] RetroBat (Windows)"
+    Write-Host "    [2] Custom locations  (manually enter the path for each thing to sync)"
     Write-Host ""
-    Write-Host "  Note: EmuDeck (Windows) and standalone ES-DE support might be"
-    Write-Host "  added in future versions. RetroDECK users should use"
-    Write-Host "  retrosync-setup.sh on Linux."
+    Write-Host "  Pick [2] if you run any non-RetroBat frontend on Windows (EmuDeck,"
+    Write-Host "  standalone ES-DE, LaunchBox, plain RetroArch, custom layouts) or"
+    Write-Host "  if your save folders live somewhere other than the default"
+    Write-Host "  RetroBat layout. RetroDECK users should use retrosync-setup.sh"
+    Write-Host "  on Linux."
     Write-Host ""
     $choice = Read-Prompt "Choice" "1"
-    if ($choice -ne '1') {
-        Write-Err "Invalid choice: $choice. Only RetroBat is supported in v$Script:RetroSyncVersion."
-        exit 1
+    switch ($choice) {
+        '1' { $Script:Frontend = 'retrobat'; Find-RetrobatBase }
+        '2' { $Script:Frontend = 'custom';   Collect-CustomPaths }
+        default {
+            Write-Err "Invalid choice: $choice."
+            exit 1
+        }
     }
-    $Script:Frontend = 'retrobat'
-    Find-RetrobatBase
 }
 
 function Find-RetrobatBase {
@@ -541,6 +640,113 @@ function Find-RetrobatBase {
         }
     }
     Write-Success "Using RetroBat base: $Script:FrontendBase"
+}
+
+# Custom mode: ask the user for an absolute path per scope (blank = skip),
+# then for an absolute path per known emulator's save folder (blank = skip).
+# Populates the $Script:Custom* state used by the scope builder and saves
+# picker.
+function Collect-CustomPaths {
+    Write-Host ""
+    Write-Host "Custom locations mode."
+    Write-Host ""
+    Write-Host "Enter the absolute path for each thing you want to sync."
+    Write-Host "Leave a prompt blank to skip that entry. Examples:"
+    Write-Host "  D:\Games\ROMs"
+    Write-Host "  $env:USERPROFILE\Emulation\BIOS"
+    Write-Host ""
+    Write-Info "Each path can point to anywhere - local drive, external drive,"
+    Write-Info "network share. Only entries you fill in will be synced."
+    Write-Host ""
+
+    # Custom mode has no single root, so FrontendBase stays empty. The scope
+    # builder emits absolute paths in the LocalSub field and Step-ApplyAll
+    # detects that and skips the Join-Path.
+    $Script:FrontendBase = ''
+
+    $Script:CustomRomsPath      = Read-Prompt "Path to ROMs folder (blank to skip)"            ''
+    $Script:CustomBiosPath      = Read-Prompt "Path to BIOS folder (blank to skip)"            ''
+    $Script:CustomStatesPath    = Read-Prompt "Path to save states folder (blank to skip)"     ''
+    $Script:CustomGamelistsPath = Read-Prompt "Path to ES-DE gamelists folder (blank to skip)" ''
+    $Script:CustomMediaPath     = Read-Prompt "Path to ES-DE downloaded media (blank to skip)" ''
+
+    # Strip trailing slashes/backslashes so subsequent joins don't end up with \\.
+    $Script:CustomRomsPath      = $Script:CustomRomsPath.TrimEnd('\','/')
+    $Script:CustomBiosPath      = $Script:CustomBiosPath.TrimEnd('\','/')
+    $Script:CustomStatesPath    = $Script:CustomStatesPath.TrimEnd('\','/')
+    $Script:CustomGamelistsPath = $Script:CustomGamelistsPath.TrimEnd('\','/')
+    $Script:CustomMediaPath     = $Script:CustomMediaPath.TrimEnd('\','/')
+
+    Write-Host ""
+    Write-Host "Per-emulator save folders."
+    Write-Host "Enter the absolute path to each emulator's save directory."
+    Write-Host "Blank = skip that emulator."
+    Write-Host ""
+
+    foreach ($entry in $Script:RetrobatSaveLocations) {
+        $path = Read-Prompt "  $($entry.Label)" ''
+        $path = $path.TrimEnd('\','/')
+        if (-not [string]::IsNullOrEmpty($path)) {
+            $Script:CustomSavePaths += [PSCustomObject]@{
+                ConsoleId = $entry.ConsoleId
+                LocalPath = $path
+            }
+        }
+    }
+
+    $count = 0
+    foreach ($p in @($Script:CustomRomsPath, $Script:CustomBiosPath,
+                     $Script:CustomStatesPath, $Script:CustomGamelistsPath,
+                     $Script:CustomMediaPath)) {
+        if (-not [string]::IsNullOrEmpty($p)) { $count++ }
+    }
+    $count += $Script:CustomSavePaths.Count
+
+    if ($count -eq 0) {
+        Write-Err "No paths entered - nothing to sync. Re-run and supply at least one path."
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Success "Collected $count custom path(s)."
+}
+
+# Re-run with Frontend=custom: rebuild $Script:Custom* state from the saved
+# folders[] so the rest of the flow doesn't re-prompt for paths.
+function Restore-CustomStateFromProfile {
+    $savedUser = if ($Script:ExistingProfile.PSObject.Properties['username']) {
+        $Script:ExistingProfile.username
+    } else { '' }
+    if ($null -eq $savedUser) { $savedUser = '' }
+
+    foreach ($folder in @($Script:ExistingProfile.folders)) {
+        $id = $folder.id
+        $lp = $folder.local_path
+        # Strip the universal "retrosync-" prefix.
+        $key = $id
+        if ($key.StartsWith("$Script:FolderIdPrefix-")) {
+            $key = $key.Substring("$Script:FolderIdPrefix-".Length)
+        }
+        # Multi-user profiles also have the username prefix; drop that too.
+        if (-not [string]::IsNullOrEmpty($savedUser) -and
+            $key.StartsWith("$savedUser-")) {
+            $key = $key.Substring("$savedUser-".Length)
+        }
+        switch -Regex ($key) {
+            '^roms$'             { $Script:CustomRomsPath      = $lp; break }
+            '^bios$'             { $Script:CustomBiosPath      = $lp; break }
+            '^custom-states$'    { $Script:CustomStatesPath    = $lp; break }
+            '^custom-gamelists$' { $Script:CustomGamelistsPath = $lp; break }
+            '^custom-media$'     { $Script:CustomMediaPath     = $lp; break }
+            '^save-(.+)$' {
+                $Script:CustomSavePaths += [PSCustomObject]@{
+                    ConsoleId = $Matches[1]
+                    LocalPath = $lp
+                }
+                break
+            }
+        }
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -930,18 +1136,68 @@ $Script:SelectedScopes       = @()
 $Script:SavesSelected        = $false
 
 function Initialize-SyncScopeDefinitions {
+    # Folder keys for the cross-frontend-shared scopes (roms, bios) stay
+    # bare so a RetroBat and a RetroDECK device pointing at the same NAS
+    # share the same Syncthing folder ID for those scopes.
+    #
+    # The frontend-specific scopes use rb-* prefixed keys here. The Bash
+    # script uses rd-* for the equivalent RetroDECK scopes. Different keys
+    # means different Syncthing folder IDs, which means a RetroBat<->RetroDECK
+    # setup just doesn't try to share those structurally-incompatible
+    # scopes (RetroBat's combined .emulationstation/ doesn't map cleanly to
+    # RetroDECK's separate ES-DE/gamelists/ + ES-DE/downloaded_media/, and
+    # RetroBat's RetroArch-only states folder doesn't map cleanly to
+    # RetroDECK's all-emulator states/).
+    #
+    # Same-frontend (RetroBat<->RetroBat, RetroDECK<->RetroDECK) sync is
+    # unaffected since both ends use the same prefixed keys.
+    if ($Script:Frontend -eq 'custom') {
+        # Custom mode: LocalSub is the user-supplied absolute path. Only
+        # include scopes the user actually entered a path for. Step-ApplyAll
+        # detects an absolute path and skips the Join-Path.
+        $defs = @()
+        if (-not [string]::IsNullOrEmpty($Script:CustomRomsPath)) {
+            $defs += [PSCustomObject]@{Key='roms'; Label='ROMs'; LocalSub=$Script:CustomRomsPath; NasSub='roms'}
+        }
+        if (-not [string]::IsNullOrEmpty($Script:CustomBiosPath)) {
+            $defs += [PSCustomObject]@{Key='bios'; Label='BIOS'; LocalSub=$Script:CustomBiosPath; NasSub='bios'}
+        }
+        if (-not [string]::IsNullOrEmpty($Script:CustomStatesPath)) {
+            $defs += [PSCustomObject]@{Key='custom-states';    Label='Save states (custom)';            LocalSub=$Script:CustomStatesPath;    NasSub='states/custom'}
+        }
+        if (-not [string]::IsNullOrEmpty($Script:CustomGamelistsPath)) {
+            $defs += [PSCustomObject]@{Key='custom-gamelists'; Label='ES-DE gamelists (custom)';        LocalSub=$Script:CustomGamelistsPath; NasSub='gamelists/custom'}
+        }
+        if (-not [string]::IsNullOrEmpty($Script:CustomMediaPath)) {
+            $defs += [PSCustomObject]@{Key='custom-media';     Label='ES-DE downloaded media (custom)'; LocalSub=$Script:CustomMediaPath;     NasSub='media/custom'}
+        }
+        $Script:SyncScopeDefinitions = @($defs)
+        return
+    }
+
     $Script:SyncScopeDefinitions = @(
-        [PSCustomObject]@{Key='roms';      Label='ROMs';                    LocalSub=$Script:RB_ROMS_SUB;      NasSub='roms'},
-        [PSCustomObject]@{Key='bios';      Label='BIOS';                    LocalSub=$Script:RB_BIOS_SUB;      NasSub='bios'},
-        [PSCustomObject]@{Key='states';    Label='RetroArch save states';   LocalSub=$Script:RB_RA_STATES_SUB; NasSub='states\retroarch'},
-        [PSCustomObject]@{Key='gamelists'; Label='ES-DE gamelists / media'; LocalSub=$Script:RB_GAMELISTS_SUB; NasSub='emulationstation'}
+        [PSCustomObject]@{Key='roms';                Label='ROMs';                                  LocalSub=$Script:RB_ROMS_SUB;      NasSub='roms'},
+        [PSCustomObject]@{Key='bios';                Label='BIOS';                                  LocalSub=$Script:RB_BIOS_SUB;      NasSub='bios'},
+        [PSCustomObject]@{Key='rb-retroarch-states'; Label='RetroArch save states (RetroBat-only)'; LocalSub=$Script:RB_RA_STATES_SUB; NasSub='states/retrobat'},
+        [PSCustomObject]@{Key='rb-emulationstation'; Label='ES-DE gamelists + media (RetroBat-only)'; LocalSub=$Script:RB_GAMELISTS_SUB; NasSub='emulationstation/retrobat'}
     )
-    # Note: RetroBat puts gamelists and downloaded media inside .emulationstation
-    # together, so we sync them as one folder.
 }
 
 function Step-SyncScope {
     Initialize-SyncScopeDefinitions
+
+    if ($Script:Frontend -eq 'custom') {
+        # In custom mode the paths the user entered already declared what to
+        # sync - re-asking "ROMs? y/n" right after they typed the ROMs path
+        # would be confusing. Auto-include every scope with a non-empty path.
+        foreach ($entry in $Script:SyncScopeDefinitions) {
+            $Script:SelectedScopes += $entry.Key
+        }
+        if ($Script:CustomSavePaths.Count -gt 0) {
+            $Script:SavesSelected = $true
+        }
+        return
+    }
 
     Write-Host ""
     Write-Host "What would you like to sync?"
@@ -985,7 +1241,11 @@ function Get-LargeRomMessage {
 function Step-RomsPicker {
     if ($Script:SelectedScopes -notcontains 'roms') { return }
 
-    $romsDir = Join-Path $Script:FrontendBase $Script:RB_ROMS_SUB
+    $romsDir = if ($Script:Frontend -eq 'custom') {
+        $Script:CustomRomsPath
+    } else {
+        Join-Path $Script:FrontendBase $Script:RB_ROMS_SUB
+    }
     if (-not (Test-Path -LiteralPath $romsDir)) {
         Write-Warn "ROMs directory not found: $romsDir"
         Write-Warn "Skipping per-console picker. All console subdirs will sync once they exist."
@@ -1042,6 +1302,42 @@ $Script:SelectedSaves = @()  # array of PSCustomObject {Label, ConsoleId, LocalP
 
 function Step-SavesPicker {
     if (-not $Script:SavesSelected) { return }
+
+    if ($Script:Frontend -eq 'custom') {
+        # Paths were collected up front. Look up the human label for each
+        # console_id from RetrobatSaveLocations, then push straight into
+        # SelectedSaves with the standard NAS subpath convention.
+        foreach ($entry in $Script:CustomSavePaths) {
+            $known = $Script:RetrobatSaveLocations |
+                     Where-Object { $_.ConsoleId -eq $entry.ConsoleId } |
+                     Select-Object -First 1
+            $label = if ($known) { $known.Label } else { $entry.ConsoleId }
+
+            $nasSub = switch ($entry.ConsoleId) {
+                'retroarch'  { 'saves\retroarch' }
+                'ps3'        { 'saves\ps3\savedata' }
+                'ps3-trophy' { 'saves\ps3\trophy' }
+                default      { "saves\$($entry.ConsoleId)" }
+            }
+
+            if (-not (Test-Path -LiteralPath $entry.LocalPath) -and -not $DryRun) {
+                try {
+                    New-Item -ItemType Directory -Path $entry.LocalPath -Force | Out-Null
+                } catch {
+                    Write-Warn "  Couldn't create $($entry.LocalPath) - skipping $label."
+                    continue
+                }
+            }
+
+            $Script:SelectedSaves += [PSCustomObject]@{
+                Label     = $label
+                ConsoleId = $entry.ConsoleId
+                LocalPath = $entry.LocalPath
+                NasSub    = $nasSub
+            }
+        }
+        return
+    }
 
     Write-Host ""
     Write-Host "Scanning for emulator save locations on this device..."
@@ -1607,10 +1903,19 @@ function Step-ApplyAll {
 
     foreach ($entry in $Script:SyncScopeDefinitions) {
         if ($Script:SelectedScopes -notcontains $entry.Key) { continue }
-        $localPath = Join-Path $Script:FrontendBase $entry.LocalSub
+        # Custom mode emits absolute paths in LocalSub - detect that and
+        # skip the Join-Path (which would prepend an empty FrontendBase
+        # producing odd results).
+        $localPath = if ([System.IO.Path]::IsPathRooted($entry.LocalSub)) {
+            $entry.LocalSub
+        } else {
+            Join-Path $Script:FrontendBase $entry.LocalSub
+        }
         $nasPath   = "$nasUserRoot/$($entry.NasSub)"
         $versioning = $false
-        if ($entry.Key -eq 'states') { $versioning = $true }
+        # Save states get versioning - they're easy to corrupt and the user
+        # benefits from being able to roll back.
+        if ($entry.Key -like '*states*') { $versioning = $true }
         $ignores = @()
         if ($entry.Key -eq 'roms' -and $Script:RomsExcluded.Count -gt 0) {
             $ignores = $Script:RomsExcluded
