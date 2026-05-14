@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.3.0"
+readonly RETROSYNC_VERSION="0.3.1"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -825,39 +825,121 @@ step_profile_detection() {
     nas_addr="$(echo "$EXISTING_PROFILE" | jq -r '.nas_syncthing.address // "?"')"
     folder_count="$(echo "$EXISTING_PROFILE" | jq -r '.folders | length')"
 
+    while true; do
+        echo
+        info "An existing ${RETROSYNC_NAME} profile was found for this device:"
+        echo "    Frontend:  ${frontend}"
+        if [[ -n "$username" ]]; then
+            echo "    Username:  ${username} (multi-user)"
+        else
+            echo "    Mode:      single-user"
+        fi
+        echo "    NAS:       ${nas_addr}"
+        echo "    Folders:   ${folder_count} configured"
+        echo
+        echo "    [1] Show current configuration (read-only — what was set up last time)"
+        echo "    [2] Update — add or change folders (keeps existing config)"
+        echo "    [3] Start fresh — delete this device's profile and reconfigure"
+        echo "        (does NOT touch Syncthing on either side; pick [4] for that)"
+        echo "    [4] Remove this device from sync (clean up Syncthing on this"
+        echo "        device and on the NAS before re-running)"
+        echo "    [5] Exit"
+        echo
+        local choice
+        choice="$(prompt "Choice" "2")"
+        case "$choice" in
+            1) show_current_config ;;
+            2) PROFILE_MODE="update"; return 0 ;;
+            3)
+                if prompt_yn "Really delete ${RETROSYNC_NAME} profile and reconfigure?" "n"; then
+                    [[ $DRY_RUN -eq 0 ]] && rm -f "$(profile_file)"
+                    EXISTING_PROFILE=""
+                    PROFILE_MODE="fresh"
+                    return 0
+                fi
+                ;;
+            4) PROFILE_MODE="remove"; return 0 ;;
+            5) exit 0 ;;
+            *) warn "Invalid choice: $choice" ;;
+        esac
+    done
+}
+
+# Read-only dump of the saved profile, designed for users who pick option [1]
+# at the re-run menu just to remember what they set up before deciding whether
+# to update or remove. Touches no state and returns to the menu.
+show_current_config() {
     echo
-    info "An existing ${RETROSYNC_NAME} profile was found for this device:"
-    echo "    Frontend:  ${frontend}"
-    if [[ -n "$username" ]]; then
-        echo "    Username:  ${username} (multi-user)"
+    hr
+    printf '%s%s — Current Configuration%s\n' "$C_BOLD" "$RETROSYNC_NAME" "$C_RESET"
+    hr
+    echo
+
+    local frontend frontend_base multi user nas_addr nas_base nas_storage
+    local tcp udp ignore_perms created updated count
+    frontend="$(echo      "$EXISTING_PROFILE" | jq -r '.frontend // "?"')"
+    frontend_base="$(echo "$EXISTING_PROFILE" | jq -r '.frontend_base_path // ""')"
+    multi="$(echo         "$EXISTING_PROFILE" | jq -r '.multi_user // false')"
+    user="$(echo          "$EXISTING_PROFILE" | jq -r '.username // ""')"
+    nas_addr="$(echo      "$EXISTING_PROFILE" | jq -r '.nas_syncthing.address // "?"')"
+    nas_base="$(echo      "$EXISTING_PROFILE" | jq -r '.nas_syncthing.nas_base // "?"')"
+    nas_storage="$(echo   "$EXISTING_PROFILE" | jq -r '.nas_syncthing.api_key_storage // "?"')"
+    tcp="$(echo           "$EXISTING_PROFILE" | jq -r '.nas_syncthing.sync_tcp_port // 22000')"
+    udp="$(echo           "$EXISTING_PROFILE" | jq -r '.nas_syncthing.sync_udp_port // 22000')"
+    ignore_perms="$(echo  "$EXISTING_PROFILE" | jq -r '.ignore_perms // true')"
+    created="$(echo       "$EXISTING_PROFILE" | jq -r '.created_at // "?"')"
+    updated="$(echo       "$EXISTING_PROFILE" | jq -r '.updated_at // "?"')"
+    count="$(echo         "$EXISTING_PROFILE" | jq -r '.folders | length')"
+
+    if [[ "$frontend" == "custom" ]]; then
+        printf '  Frontend:        custom locations\n'
     else
-        echo "    Mode:      single-user"
+        printf '  Frontend:        %s\n' "$frontend"
+        printf '  Frontend base:   %s\n' "$frontend_base"
     fi
-    echo "    NAS:       ${nas_addr}"
-    echo "    Folders:   ${folder_count} configured"
+    if [[ "$multi" == "true" ]]; then
+        printf '  Mode:            multi-user (username: %s)\n' "$user"
+    else
+        printf '  Mode:            single-user\n'
+    fi
+    printf '  NAS address:     %s\n' "$nas_addr"
+    printf '  NAS base:        %s\n' "$nas_base"
+    printf '  API key storage: %s\n' "$nas_storage"
+    printf '  Sync ports:      %s/tcp, %s/udp\n' "$tcp" "$udp"
+    printf '  Ignore perms:    %s\n' "$ignore_perms"
+    printf '  Created:         %s\n' "$created"
+    printf '  Updated:         %s\n' "$updated"
+    printf '  Profile file:    %s\n' "$(profile_file)"
+
     echo
-    echo "    [1] Update — add or change folders (keeps existing config)"
-    echo "    [2] Start fresh — delete profile and reconfigure"
-    echo "    [3] Remove this device from sync (clean up before re-running)"
-    echo "    [4] Exit"
-    echo
-    local choice
-    choice="$(prompt "Choice" "1")"
-    case "$choice" in
-        1) PROFILE_MODE="update" ;;
-        2)
-            if prompt_yn "Really delete ${RETROSYNC_NAME} profile and reconfigure?" "n"; then
-                [[ $DRY_RUN -eq 0 ]] && rm -f "$(profile_file)"
-                EXISTING_PROFILE=""
-                PROFILE_MODE="fresh"
-            else
-                exit 0
+    echo "  Synced folders (${count}):"
+    if [[ "$count" == "0" ]]; then
+        echo "    (none)"
+    else
+        printf '    %-26s %-12s %-12s %s\n' "Name" "Direction" "Versioning" "Local Path"
+        printf '    %s\n' "──────────────────────────────────────────────────────────────────────"
+        local row name type ver lp np ign arrow v
+        while IFS= read -r row; do
+            name="$(echo "$row" | jq -r '.name')"
+            type="$(echo "$row" | jq -r '.type')"
+            ver="$(echo  "$row" | jq -r '.versioning')"
+            lp="$(echo   "$row" | jq -r '.local_path')"
+            np="$(echo   "$row" | jq -r '.nas_path')"
+            ign="$(echo  "$row" | jq -r '(.ignore_patterns // []) | join(",")')"
+            v="off"
+            [[ "$ver" == "true" ]] && v="5 versions"
+            arrow="$(direction_arrow "$type")"
+            printf '    %-26s %-12s %-12s %s\n' "$name" "$arrow" "$v" "${lp/#$HOME/~}"
+            printf '    %26s %-12s %-12s NAS: %s\n' "" "" "" "$np"
+            if [[ -n "$ign" ]]; then
+                printf '    %26s %-12s %-12s ignored: %s\n' "" "" "" "$ign"
             fi
-            ;;
-        3) PROFILE_MODE="remove" ;;
-        4) exit 0 ;;
-        *) fatal "Invalid choice: $choice" ;;
-    esac
+        done < <(echo "$EXISTING_PROFILE" | jq -c '.folders[]')
+    fi
+
+    echo
+    hr
+    prompt "Press Enter to return to the menu" "" >/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

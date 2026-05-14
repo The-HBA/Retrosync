@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.3.0'
+$Script:RetroSyncVersion = '0.3.1'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -551,36 +551,103 @@ function Step-ProfileDetection {
     if (-not (Test-ProfileExists)) { return }
 
     $Script:ExistingProfile = Read-Profile
-    Write-Host ""
-    Write-Info "An existing $Script:RetroSyncName profile was found for this device:"
-    Write-Host ("    Frontend:  {0}" -f $Script:ExistingProfile.frontend)
-    if ($Script:ExistingProfile.username) {
-        Write-Host ("    Username:  {0} (multi-user)" -f $Script:ExistingProfile.username)
-    } else {
-        Write-Host  "    Mode:      single-user"
-    }
-    Write-Host ("    NAS:       {0}" -f $Script:ExistingProfile.nas_syncthing.address)
-    Write-Host ("    Folders:   {0} configured" -f $Script:ExistingProfile.folders.Count)
-    Write-Host ""
-    Write-Host "    [1] Update - add or change folders (keeps existing config)"
-    Write-Host "    [2] Start fresh - delete profile and reconfigure"
-    Write-Host "    [3] Remove this device from sync (clean up before re-running)"
-    Write-Host "    [4] Exit"
-    Write-Host ""
-    $choice = Read-Prompt "Choice" "1"
-    switch ($choice) {
-        '1' { $Script:ProfileMode = 'update' }
-        '2' {
-            if (Read-PromptYn "Really delete $Script:RetroSyncName profile and reconfigure?" 'n') {
-                if (-not $DryRun) { Remove-Item -LiteralPath (Get-ProfileFile) -Force }
-                $Script:ExistingProfile = $null
-                $Script:ProfileMode = 'fresh'
-            } else { exit 0 }
+
+    while ($true) {
+        Write-Host ""
+        Write-Info "An existing $Script:RetroSyncName profile was found for this device:"
+        Write-Host ("    Frontend:  {0}" -f $Script:ExistingProfile.frontend)
+        if ($Script:ExistingProfile.username) {
+            Write-Host ("    Username:  {0} (multi-user)" -f $Script:ExistingProfile.username)
+        } else {
+            Write-Host  "    Mode:      single-user"
         }
-        '3' { $Script:ProfileMode = 'remove' }
-        '4' { exit 0 }
-        default { Write-Err "Invalid choice: $choice"; exit 1 }
+        Write-Host ("    NAS:       {0}" -f $Script:ExistingProfile.nas_syncthing.address)
+        Write-Host ("    Folders:   {0} configured" -f $Script:ExistingProfile.folders.Count)
+        Write-Host ""
+        Write-Host "    [1] Show current configuration (read-only - what was set up last time)"
+        Write-Host "    [2] Update - add or change folders (keeps existing config)"
+        Write-Host "    [3] Start fresh - delete this device's profile and reconfigure"
+        Write-Host "        (does NOT touch Syncthing on either side; pick [4] for that)"
+        Write-Host "    [4] Remove this device from sync (clean up Syncthing on this"
+        Write-Host "        device and on the NAS before re-running)"
+        Write-Host "    [5] Exit"
+        Write-Host ""
+        $choice = Read-Prompt "Choice" "2"
+        switch ($choice) {
+            '1' { Show-CurrentConfig }
+            '2' { $Script:ProfileMode = 'update'; return }
+            '3' {
+                if (Read-PromptYn "Really delete $Script:RetroSyncName profile and reconfigure?" 'n') {
+                    if (-not $DryRun) { Remove-Item -LiteralPath (Get-ProfileFile) -Force }
+                    $Script:ExistingProfile = $null
+                    $Script:ProfileMode = 'fresh'
+                    return
+                }
+            }
+            '4' { $Script:ProfileMode = 'remove'; return }
+            '5' { exit 0 }
+            default { Write-Warn "Invalid choice: $choice" }
+        }
     }
+}
+
+# Read-only dump of the saved profile, for users who pick option [1] at the
+# re-run menu just to remember what they set up before deciding whether to
+# update or remove. Touches no state and returns to the menu.
+function Show-CurrentConfig {
+    Write-Host ""
+    Write-Hr
+    Write-Color "$Script:RetroSyncName - Current Configuration" White
+    Write-Hr
+    Write-Host ""
+
+    $p = $Script:ExistingProfile
+    if ($p.frontend -eq 'custom') {
+        Write-Host "  Frontend:        custom locations"
+    } else {
+        Write-Host ("  Frontend:        {0}" -f $p.frontend)
+        Write-Host ("  Frontend base:   {0}" -f $p.frontend_base_path)
+    }
+    if ($p.multi_user) {
+        Write-Host ("  Mode:            multi-user (username: {0})" -f $p.username)
+    } else {
+        Write-Host  "  Mode:            single-user"
+    }
+    Write-Host ("  NAS address:     {0}" -f $p.nas_syncthing.address)
+    Write-Host ("  NAS base:        {0}" -f $p.nas_syncthing.nas_base)
+    Write-Host ("  API key storage: {0}" -f $p.nas_syncthing.api_key_storage)
+    $tcp = if ($p.nas_syncthing.sync_tcp_port) { $p.nas_syncthing.sync_tcp_port } else { 22000 }
+    $udp = if ($p.nas_syncthing.sync_udp_port) { $p.nas_syncthing.sync_udp_port } else { 22000 }
+    Write-Host ("  Sync ports:      {0}/tcp, {1}/udp" -f $tcp, $udp)
+    Write-Host ("  Ignore perms:    {0}" -f $p.ignore_perms)
+    Write-Host ("  Created:         {0}" -f $p.created_at)
+    Write-Host ("  Updated:         {0}" -f $p.updated_at)
+    Write-Host ("  Profile file:    {0}" -f (Get-ProfileFile))
+
+    Write-Host ""
+    $count = @($p.folders).Count
+    Write-Host ("  Synced folders ({0}):" -f $count)
+    if ($count -eq 0) {
+        Write-Host "    (none)"
+    } else {
+        "{0,-26} {1,-14} {2,-12} {3}" -f 'Name','Direction','Versioning','Local Path' |
+            ForEach-Object { Write-Host "    $_" }
+        Write-Host ('    ' + ('-' * 70))
+        foreach ($f in $p.folders) {
+            $v = if ($f.versioning) { '5 versions' } else { 'off' }
+            "{0,-26} {1,-14} {2,-12} {3}" -f $f.name, (Get-DirectionArrow $f.type), $v, $f.local_path |
+                ForEach-Object { Write-Host "    $_" }
+            Write-Host ("    {0,-26} {1,-14} {2,-12} NAS: {3}" -f '','','', $f.nas_path)
+            $ign = @($f.ignore_patterns)
+            if ($ign.Count -gt 0) {
+                Write-Host ("    {0,-26} {1,-14} {2,-12} ignored: {3}" -f '','','', ($ign -join ','))
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Hr
+    Read-Prompt "Press Enter to return to the menu" '' | Out-Null
 }
 
 # -----------------------------------------------------------------------------
