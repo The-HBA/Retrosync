@@ -8,7 +8,7 @@ ROMs, BIOS, saves, save states, and ES-DE metadata — in sync between your
 client devices and a central NAS hub. One interactive setup, idempotent
 re-runs, and the GUI stays untouched.
 
-> **Status:** v0.2.1 — Windows ↔ Windows (RetroBat) syncing is stable. Currently testing Linux ↔ Linux (RetroDECK) and cross-OS syncing! Please open an issue if anything breaks. Feel free to contribute or build on the idea.
+> **Status:** v0.3.0 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing. v0.3.0 adds a **custom locations** mode that works with any frontend or layout (manually enter the path for each thing to sync). Please open an issue if anything breaks. Feel free to contribute or build on the idea.
 
 ---
 
@@ -35,16 +35,25 @@ duplicates.
 
 ---
 
-## v0.2.1 scope
+## v0.3.0 scope
 
 | Frontend | Status |
 |---|---|
 | RetroBat (Windows)                     | ✅ Supported (Stable) |
 | RetroDECK (Linux Flatpak)              | ✅ Supported (Testing) |
-| EmuDeck (Linux)                        | 🔜 Planned |
-| EmuDeck (Windows)                      | 🔜 Planned |
-| Standalone ES-DE                       | ❓ Not on roadmap; PRs welcome |
-| Batocera, Lakka, RecalBox              | ❓ Not on roadmap; PRs welcome |
+| **Custom locations (any frontend, any layout)** | ✅ **New in v0.3.0** |
+| EmuDeck (Linux)                        | 🔜 Planned (works today via custom mode) |
+| EmuDeck (Windows)                      | 🔜 Planned (works today via custom mode) |
+| Standalone ES-DE                       | ✅ Works via custom mode |
+| Batocera, Lakka, RecalBox              | ✅ Works via custom mode |
+
+**Custom mode** lets you manually enter the absolute path for each thing
+you want to sync (ROMs, BIOS, save states, ES-DE gamelists, ES-DE media,
+plus per-emulator save folders). Leave a prompt blank to skip that entry.
+This makes RetroSync work with any frontend, any folder layout, or no
+frontend at all — at the cost of typing the paths yourself instead of
+having them auto-detected. Pick option `[2] Custom locations` when the
+script asks which frontend you're using.
 
 ---
 
@@ -219,9 +228,13 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
      folders, otherwise fully deletes); optionally delete local data and/or
      point you at the NAS data to delete manually
    - `[4] Exit`
-3. **Frontend selection.** RetroDECK or RetroBat. The script auto-detects the
-   install path (parses `retrodeck.cfg` on Linux to find custom `rdhome=`
-   locations) and lets you confirm or override.
+3. **Frontend selection.** Pick `[1]` for RetroDECK (Linux) or RetroBat
+   (Windows) — the script auto-detects the install path (parses
+   `retrodeck.cfg` on Linux to find custom `rdhome=` locations) and lets
+   you confirm or override. Pick `[2] Custom locations` for any other
+   layout — the script then asks for the absolute path to each thing you
+   want to sync (ROMs, BIOS, states, gamelists, media, then per-emulator
+   save folders); leave a prompt blank to skip that entry.
 4. **NAS connection.** Address (port defaults to 8384 if omitted), API key,
    ping check, device-ID exchange, and pairs the devices on both sides. Pins
    the NAS device's address to `tcp://<host>:22000` so future connects don't
@@ -454,8 +467,15 @@ gracefully. If you're on an older version, upgrade and re-run.
 
 ## Known limitations
 
-- v0.2 supports RetroDECK and RetroBat only. EmuDeck and standalone ES-DE
-  planned.
+- v0.3 supports RetroDECK and RetroBat with auto-detection, plus a
+  custom-locations mode for any other frontend (EmuDeck, standalone ES-DE,
+  Batocera, Lakka, plain RetroArch, custom layouts). First-class support
+  for EmuDeck with auto-detection is planned.
+- In custom mode, re-running the script does not re-prompt for paths or
+  let you add new emulator save folders interactively — it re-applies the
+  paths from the saved profile. To add a new path, either edit
+  `profile.json` directly or use `[3] Remove this device from sync` and
+  re-setup.
 - The script does not install Syncthing for you. It assumes Syncthing is
   already running.
 - The script does not create the NAS-side mount path. You must mount your
