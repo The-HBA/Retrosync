@@ -8,7 +8,7 @@ ROMs, BIOS, saves, save states, and ES-DE metadata — in sync between your
 client devices and a central NAS hub. One interactive setup, idempotent
 re-runs, and the GUI stays untouched.
 
-> **Status:** v0.3.0 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing. v0.3.0 adds a **custom locations** mode that works with any frontend or layout (manually enter the path for each thing to sync). Please open an issue if anything breaks. Feel free to contribute or build on the idea.
+> **Status:** v0.3.1 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing.
 
 ---
 
