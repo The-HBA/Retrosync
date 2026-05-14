@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.3.1"
+readonly RETROSYNC_VERSION="0.3.2"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -619,6 +619,32 @@ check_bash_version() {
     if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
         fatal "${RETROSYNC_NAME} requires Bash 4.0 or later (you have ${BASH_VERSION})."
     fi
+}
+
+get_hostname() {
+    # Return this device's short hostname using whatever mechanism is
+    # available. Stock SteamOS (Steam Deck Game Mode) doesn't ship the
+    # `hostname` binary at all, so we cascade through the alternatives
+    # before falling back to a generic "device" sentinel.
+    local h=""
+    if [[ -n "${HOSTNAME:-}" ]]; then
+        h="$HOSTNAME"
+    fi
+    if [[ -z "$h" ]] && [[ -r /etc/hostname ]]; then
+        h="$(cat /etc/hostname 2>/dev/null || true)"
+    fi
+    if [[ -z "$h" ]] && command -v hostnamectl >/dev/null 2>&1; then
+        h="$(hostnamectl --static 2>/dev/null || true)"
+    fi
+    if [[ -z "$h" ]] && command -v hostname >/dev/null 2>&1; then
+        h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    fi
+    # Trim whitespace and reduce FQDN to short form.
+    h="${h//$'\n'/}"
+    h="${h//$'\r'/}"
+    h="${h%%.*}"
+    [[ -z "$h" ]] && h="device"
+    echo "$h"
 }
 
 check_required_tools() {
@@ -1503,7 +1529,7 @@ pair_devices() {
     nas_cfg="$(st_get nas "/config/devices")"     || fatal "Could not read NAS devices"
 
     local local_hostname nas_hostname
-    local_hostname="$(hostname -s 2>/dev/null || hostname)"
+    local_hostname="$(get_hostname)"
     # Use a heuristic NAS hostname — the user can rename in the GUI later.
     nas_hostname="NAS-Syncthing"
 
@@ -2574,7 +2600,7 @@ print_summary() {
     printf '%s%s Setup Complete%s\n' "$C_BOLD" "$RETROSYNC_NAME" "$C_RESET"
     hr
     echo
-    printf '  Device:    %s\n' "$(hostname -s 2>/dev/null || hostname)"
+    printf '  Device:    %s\n' "$(get_hostname)"
     printf '  Frontend:  %s\n' "$FRONTEND"
     if [[ $MULTI_USER -eq 1 ]]; then
         printf '  Mode:      multi-user (username: %s)\n' "$USERNAME"
@@ -2617,7 +2643,7 @@ build_profile_json() {
     local now
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     local hostname
-    hostname="$(hostname -s 2>/dev/null || hostname)"
+    hostname="$(get_hostname)"
 
     # Build folders array.
     local folders_json="[]" entry id label lp np dir ver ignores
