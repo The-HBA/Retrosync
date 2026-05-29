@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.4.0'
+$Script:RetroSyncVersion = '0.4.1'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -342,7 +342,11 @@ function Show-MultiSelect {
     for ($i = 0; $i -lt $n; $i++) {
         if ($checked[$i]) { $result += $Items[$i] }
     }
-    return ,$result
+    # Plain return (NOT ",$result"): every caller wraps the result in @(), and
+    # the comma-wrapped form makes @() see the whole array as a single element
+    # (Count always 1), which silently breaks the per-game selection. Returning
+    # the bare array lets the caller's @() normalize empty/one/many correctly.
+    return $result
 }
 
 # -----------------------------------------------------------------------------

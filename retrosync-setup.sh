@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.4.0"
+readonly RETROSYNC_VERSION="0.4.1"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -374,7 +374,13 @@ tui_multiselect() {
                 fi
             done
             selcount=0
-            for ((i = 0; i < n; i++)); do [[ ${checked[i]} -eq 1 ]] && ((selcount++)); done
+            # NOTE: do NOT write `[[ ... ]] && ((selcount++))` — under
+            # `set -e`, ((x++)) returns exit 1 when x was 0 (post-increment
+            # yields the old value), and as the final command in an && list
+            # that aborts the whole script. Use an explicit if + assignment.
+            for ((i = 0; i < n; i++)); do
+                if [[ ${checked[i]} -eq 1 ]]; then selcount=$((selcount + 1)); fi
+            done
             printf '\033[2K  %s%d of %d selected%s\n' "$C_GREY" "$selcount" "$n" "$C_RESET"
         } >&2
 
@@ -382,9 +388,11 @@ tui_multiselect() {
         if [[ "$key" == $'\x1b' ]]; then
             # Escape sequence — read the two trailing chars of an arrow key.
             read -rsn2 -t 0.05 rest || rest=""
+            # Same set -e caveat as above: ((cursor++)) from 0 returns exit 1,
+            # so use if + assignment rather than `(( cond )) && ((cursor++))`.
             case "$rest" in
-                '[A') (( cursor > 0 ))     && ((cursor--)) ;;   # up
-                '[B') (( cursor < n - 1 )) && ((cursor++)) ;;   # down
+                '[A') if (( cursor > 0 ));     then cursor=$((cursor - 1)); fi ;;   # up
+                '[B') if (( cursor < n - 1 )); then cursor=$((cursor + 1)); fi ;;   # down
             esac
         elif [[ "$key" == " " ]]; then
             checked[cursor]=$(( 1 - checked[cursor] ))
@@ -3027,7 +3035,7 @@ print_summary() {
         printf '    %s\n' "${ROMS_EXCLUDED[*]}"
     fi
 
-    if (( ${#ROMS_GAME_SELECTED[@]:-0} > 0 )); then
+    if (( ${#ROMS_GAME_SELECTED[@]} > 0 )); then
         echo
         echo "  Consoles syncing only selected games on this device:"
         # Tally per-console counts from ROMS_GAME_SELECTED ("console|game").
