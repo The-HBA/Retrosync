@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.4.1'
+$Script:RetroSyncVersion = '0.4.2'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -2286,6 +2286,86 @@ function Get-RomsIgnoreLines {
     return @($includes + $excludes)
 }
 
+# -----------------------------------------------------------------------------
+# Case-collision detection
+# -----------------------------------------------------------------------------
+# A case collision is two entries in the same directory whose names match when
+# lowercased but differ in actual case (e.g. databases/ + Databases/). A
+# case-insensitive peer can't hold both, so Syncthing gets stuck "out of sync"
+# on everything beneath them. NTFS itself can't create such pairs, so on
+# Windows this usually finds nothing - but a folder synced FROM a case-
+# sensitive Linux peer can still surface them, and the check is cheap.
+#
+# Returns an array of human-readable collision strings (empty = clean).
+function Find-CaseCollisions {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return @() }
+    $reports = @()
+    try {
+        $items = Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+        $groups = $items | Group-Object { (Split-Path $_.FullName -Parent) + "`0" + $_.Name.ToLower() }
+        foreach ($g in $groups) {
+            $distinct = @($g.Group | Select-Object -ExpandProperty Name -Unique)
+            if ($distinct.Count -gt 1) {
+                $parent = Split-Path $g.Group[0].FullName -Parent
+                $reports += ($distinct | ForEach-Object { Join-Path $parent $_ }) -join '  <->  '
+            }
+        }
+    } catch {
+        Write-Verb "Case-collision scan of $Root skipped: $($_.Exception.Message)"
+    }
+    return $reports
+}
+
+# Scan every local folder we're about to sync and warn about case collisions.
+# Informational + continue prompt; does not block.
+function Step-CaseCollisionCheck {
+    $paths = @()
+    foreach ($entry in $Script:SyncScopeDefinitions) {
+        if ($Script:SelectedScopes -notcontains $entry.Key) { continue }
+        $lp = if ([System.IO.Path]::IsPathRooted($entry.LocalSub)) {
+            $entry.LocalSub
+        } else {
+            Join-Path $Script:FrontendBase $entry.LocalSub
+        }
+        $paths += $lp
+    }
+    foreach ($s in $Script:SelectedSaves) { $paths += $s.LocalPath }
+    if ($paths.Count -eq 0) { return }
+
+    Write-Host ""
+    Write-Info "Checking for filename case collisions (cross-OS sync blocker)..."
+    $found = $false
+    foreach ($p in $paths) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $reports = @(Find-CaseCollisions -Root $p)
+        if ($reports.Count -gt 0) {
+            $found = $true
+            Write-Host ""
+            Write-Warn "Case collision(s) under: $p"
+            foreach ($r in $reports) { Write-Color "    $r" DarkYellow }
+        }
+    }
+
+    if ($found) {
+        Write-Host ""
+        Write-WarnBlock @(
+            "The paths above differ only in upper/lower case. A case-insensitive",
+            "device (Windows, or a ZFS dataset with casesensitivity != sensitive)",
+            "can't hold both names, so Syncthing will get stuck 'out of sync' on",
+            "everything under them. Fix on the case-sensitive side (usually Linux):",
+            "merge or rename so only ONE casing exists, then continue."
+        )
+        Write-Host ""
+        if (-not (Read-PromptYn "Continue anyway? (you can fix the collisions and they'll resolve)" 'y')) {
+            Write-Err "Cancelled - fix the case collisions and re-run."
+            exit 1
+        }
+    } else {
+        Write-Success "No case collisions found."
+    }
+}
+
 $Script:AppliedFolders = @()  # array of PSCustomObject
 
 function New-ProvisionedFolder {
@@ -2773,6 +2853,7 @@ function Invoke-Main {
     Step-SavesPicker
     Step-IgnorePerms
     Step-SyncDirection
+    Step-CaseCollisionCheck
 
     Write-Host ""
     $totalFolders = $Script:SelectedScopes.Count + $Script:SelectedSaves.Count

@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.4.1"
+readonly RETROSYNC_VERSION="0.4.2"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -2927,6 +2927,98 @@ provision_folder() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Case-collision detection
+# ─────────────────────────────────────────────────────────────────────────────
+# A case collision is two entries in the SAME directory whose names are equal
+# when lowercased but differ in actual case (e.g. databases/ + Databases/, or
+# "Bully (USA).iso" + "bully (usa).iso"). Linux ext4/btrfs allow both to exist;
+# a case-insensitive peer (Windows NTFS, or a ZFS dataset created with
+# casesensitivity != sensitive) cannot hold both, so Syncthing can't reconcile
+# them and every item under the collision is stuck "out of sync" forever.
+#
+# This is a genuine deal-breaker for cross-OS sync, so we scan each selected
+# local folder up front and warn loudly with the exact paths before applying.
+#
+# find_case_collisions <root>
+#   Echoes a human-readable block per collision. Returns 0 if any were found,
+#   1 if the tree is clean. GNU find (-printf) — Linux only, which is exactly
+#   where collisions can exist.
+find_case_collisions() {
+    local root="$1"
+    [[ -d "$root" ]] || return 1
+    local out
+    out="$(find "$root" -mindepth 1 -printf '%h\t%f\n' 2>/dev/null | awk -F'\t' '
+        {
+            key = $1 SUBSEP tolower($2)
+            if (key in firstname) {
+                if (firstname[key] != $2)
+                    coll[key] = coll[key] "\n    " $1 "/" firstname[key] "  <->  " $1 "/" $2
+            } else {
+                firstname[key] = $2
+            }
+        }
+        END { for (k in coll) print coll[k] }
+    ')"
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    return 1
+}
+
+# Scan every local folder we're about to sync for case collisions and warn.
+# Informational + a continue prompt; it does not block (the folder still gets
+# created, and once you fix the collision on the case-sensitive side it
+# resolves on its own).
+step_case_collision_check() {
+    # Gather the local paths we're about to provision.
+    local -a paths=()
+    local entry key _l _ns lp sentry _sl _sc spath _snas
+
+    for entry in "${SYNC_SCOPE_DEFINITIONS[@]}"; do
+        IFS='|' read -r key _ _l _ns <<< "$entry"
+        printf '%s\n' "${SELECTED_SCOPES[@]}" | grep -qx "$key" || continue
+        if [[ "$_l" == /* ]]; then lp="$_l"; else lp="${FRONTEND_BASE}/${_l}"; fi
+        paths+=("$lp")
+    done
+    for sentry in "${SELECTED_SAVES[@]:-}"; do
+        [[ -z "$sentry" ]] && continue
+        IFS='|' read -r _sl _sc spath _snas <<< "$sentry"
+        paths+=("$spath")
+    done
+
+    (( ${#paths[@]} == 0 )) && return 0
+
+    echo
+    info "Checking for filename case collisions (cross-OS sync blocker)…"
+    local p report found=0
+    for p in "${paths[@]}"; do
+        [[ -d "$p" ]] || continue
+        if report="$(find_case_collisions "$p")"; then
+            found=1
+            echo
+            warn "Case collision(s) under: ${p/#$HOME/~}"
+            printf '%s%s%s\n' "$C_YELLOW" "$report" "$C_RESET" >&2
+        fi
+    done
+
+    if [[ $found -eq 1 ]]; then
+        echo
+        warn "The paths above differ only in upper/lower case. A case-insensitive
+   device (Windows, or a ZFS dataset with casesensitivity != sensitive)
+   can't hold both names, so Syncthing will get stuck 'out of sync' on
+   everything under them. Fix on the case-sensitive (Linux) side: merge or
+   rename so only ONE casing exists, then continue."
+        echo
+        if ! prompt_yn "Continue anyway? (you can fix the collisions and they'll resolve)" "y"; then
+            fatal "Cancelled — fix the case collisions and re-run."
+        fi
+    else
+        success "No case collisions found."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 8 driver — apply all selected folders
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3446,6 +3538,7 @@ main() {
     step_saves_picker
     step_ignore_perms
     step_sync_direction
+    step_case_collision_check
 
     # Summary of intent before applying.
     echo
