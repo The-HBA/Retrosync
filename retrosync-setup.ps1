@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.3.2'
+$Script:RetroSyncVersion = '0.4.0'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -235,6 +235,114 @@ function Read-PromptSecret {
     $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try   { return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
     finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+# -----------------------------------------------------------------------------
+# Terminal multiselect checkbox (no extra modules). Arrow keys move, SPACE
+# toggles, A=all, N=none, ENTER confirms. Returns an array of the chosen
+# items (defaults to all selected). Falls back to "select all" when no
+# interactive console is available (redirected/non-interactive host).
+#
+# Uses native [Console] cursor positioning rather than ANSI escapes, so it
+# works on a stock Windows PowerShell 5.1 conhost (which doesn't enable VT
+# processing by default and treats `e sequences as PS 6+ only).
+#
+# Usage: $picked = Show-MultiSelect -Prompt "..." -Items $array
+# -----------------------------------------------------------------------------
+function Show-MultiSelect {
+    param(
+        [string]   $Prompt,
+        [string[]] $Items
+    )
+    $n = $Items.Count
+    if ($n -eq 0) { return @() }
+
+    # No interactive console (redirected stdin/stdout, ISE, CI) -> select all
+    # so non-interactive runs don't throw on ReadKey / SetCursorPosition.
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        return @($Items)
+    }
+
+    $checked = New-Object 'bool[]' $n
+    for ($i = 0; $i -lt $n; $i++) { $checked[$i] = $true }   # default: all on
+    $cursor = 0
+    $maxVisible = [Math]::Min(15, $n)
+    $totalLines = $maxVisible + 4   # 2 header + 1 blank + items + 1 footer
+
+    # Reserve the block and capture its top row. Writing the blank lines first
+    # forces any needed scroll to happen now, so the captured row stays valid.
+    $arrows = [char]0x2191 + '/' + [char]0x2193
+    $dot    = [char]0x00B7
+    $header = "  $arrows move $dot SPACE toggle $dot A=all $dot N=none $dot ENTER confirm"
+
+    try {
+        for ($i = 0; $i -lt $totalLines; $i++) { [Console]::WriteLine() }
+        $startRow = [Console]::CursorTop - $totalLines
+        if ($startRow -lt 0) { $startRow = 0 }
+        $width = [Console]::WindowWidth
+
+        $done = $false
+        while (-not $done) {
+            $start = $cursor - [int]($maxVisible / 2)
+            if ($start -lt 0) { $start = 0 }
+            if ($start -gt $n - $maxVisible) { $start = $n - $maxVisible }
+            if ($start -lt 0) { $start = 0 }
+
+            $lines = New-Object System.Collections.Generic.List[string]
+            $lines.Add($Prompt)
+            $lines.Add($header)
+            $lines.Add('')
+            for ($i = $start; $i -lt $start + $maxVisible; $i++) {
+                if ($i -lt $n) {
+                    $mark = if ($checked[$i]) { 'x' } else { ' ' }
+                    $pre  = if ($i -eq $cursor) { '  > ' } else { '    ' }
+                    $lines.Add("$pre[$mark] $($Items[$i])")
+                } else {
+                    $lines.Add('')
+                }
+            }
+            $selCount = 0
+            for ($i = 0; $i -lt $n; $i++) { if ($checked[$i]) { $selCount++ } }
+            $lines.Add("  $selCount of $n selected")
+
+            [Console]::SetCursorPosition(0, $startRow)
+            $row = $startRow
+            foreach ($ln in $lines) {
+                $text = $ln
+                if ($text.Length -gt $width - 1) { $text = $text.Substring(0, $width - 1) }
+                # Pad to clear any leftover characters from a previous frame.
+                [Console]::SetCursorPosition(0, $row)
+                [Console]::Write($text.PadRight($width - 1))
+                $row++
+            }
+
+            $keyInfo = [Console]::ReadKey($true)
+            switch ($keyInfo.Key) {
+                'UpArrow'   { if ($cursor -gt 0)      { $cursor-- } }
+                'DownArrow' { if ($cursor -lt $n - 1) { $cursor++ } }
+                'Spacebar'  { $checked[$cursor] = -not $checked[$cursor] }
+                'Enter'     { $done = $true }
+                default {
+                    $ch = [char]::ToLower($keyInfo.KeyChar)
+                    if     ($ch -eq 'a') { for ($i=0;$i -lt $n;$i++){ $checked[$i] = $true } }
+                    elseif ($ch -eq 'n') { for ($i=0;$i -lt $n;$i++){ $checked[$i] = $false } }
+                }
+            }
+        }
+        # Park the cursor just below the block.
+        [Console]::SetCursorPosition(0, [Math]::Min($startRow + $totalLines, [Console]::BufferHeight - 1))
+    } catch {
+        # Any console-geometry hiccup (tiny window, odd host) -> don't crash the
+        # whole setup; fall back to selecting all.
+        Write-Verb "Show-MultiSelect fell back to select-all: $($_.Exception.Message)"
+        return @($Items)
+    }
+
+    $result = @()
+    for ($i = 0; $i -lt $n; $i++) {
+        if ($checked[$i]) { $result += $Items[$i] }
+    }
+    return ,$result
 }
 
 # -----------------------------------------------------------------------------
@@ -822,6 +930,10 @@ function Restore-CustomStateFromProfile {
 
 $Script:MultiUser = $false
 $Script:Username  = ''
+# Set to $true in Step-NasLayout when the user picks an existing user from the
+# NAS-side picker. Step-SetupRole reads it to skip the first-device prompt and
+# default to receive-only direction.
+$Script:JoinedExistingUser = $false
 
 function Get-FolderId {
     param([string]$Key)
@@ -832,6 +944,90 @@ function Get-FolderId {
 function Get-NasUserRoot {
     if ($Script:MultiUser) { return "$Script:NasBaseDir/$Script:Username" }
     return $Script:NasBaseDir
+}
+
+# -----------------------------------------------------------------------------
+# Multi-user discovery - probe the NAS Syncthing config for existing users
+# -----------------------------------------------------------------------------
+# Reserved top-level NAS subpaths the script creates for single-user setups.
+# A directory whose first path component (under NasBaseDir) matches one of
+# these is a *scope* folder, not a user folder.
+$Script:ReservedScopeNames = @('roms','bios','saves','states','gamelists','media','emulationstation')
+
+function Test-ReservedScopeName {
+    param([string]$Name)
+    return ($Script:ReservedScopeNames -contains $Name)
+}
+
+# Query the NAS Syncthing config and return an array of PSCustomObject
+# { User; Count } for each distinct user found under NasBaseDir. Returns
+# @() when no multi-user folders are configured (or the NAS config can't
+# be read).
+function Get-NasUsers {
+    $base = $Script:NasBaseDir.TrimEnd('/')
+    $folders = @()
+    try {
+        $folders = @(Invoke-SyncthingGet 'nas' '/config/folders')
+    } catch {
+        Write-Verb "  Could not read NAS /config/folders: $($_.Exception.Message)"
+        return @()
+    }
+    if (-not $folders -or $folders.Count -eq 0) { return @() }
+
+    $hits = @{}
+    foreach ($f in $folders) {
+        if (-not $f.path) { continue }
+        $p = $f.path
+        if (-not $p.StartsWith($base + '/')) { continue }
+        $rest = $p.Substring($base.Length + 1)
+        $first = ($rest -split '[/\\]')[0]
+        if ([string]::IsNullOrEmpty($first))   { continue }
+        if (Test-ReservedScopeName $first)     { continue }
+        if (-not $hits.ContainsKey($first))    { $hits[$first] = 0 }
+        $hits[$first] = $hits[$first] + 1
+    }
+
+    return @(
+        $hits.GetEnumerator() | Sort-Object Key | ForEach-Object {
+            [PSCustomObject]@{ User = $_.Key; Count = $_.Value }
+        }
+    )
+}
+
+# Returns $true if the NAS has any folder configured at a single-user-style
+# path (first component under NasBaseDir matches a reserved scope name).
+function Test-NasSingleUserFolders {
+    $base = $Script:NasBaseDir.TrimEnd('/')
+    $folders = @()
+    try {
+        $folders = @(Invoke-SyncthingGet 'nas' '/config/folders')
+    } catch { return $false }
+    if (-not $folders -or $folders.Count -eq 0) { return $false }
+
+    foreach ($f in $folders) {
+        if (-not $f.path) { continue }
+        $p = $f.path
+        if (-not $p.StartsWith($base + '/')) { continue }
+        $rest = $p.Substring($base.Length + 1)
+        $first = ($rest -split '[/\\]')[0]
+        if (Test-ReservedScopeName $first) { return $true }
+    }
+    return $false
+}
+
+# Prompt for a new username until input is valid. Returns the chosen name.
+function Read-NewUsername {
+    while ($true) {
+        $u = Read-Prompt "Username"
+        if ([string]::IsNullOrEmpty($u))     { Write-Warn "Username cannot be empty."; continue }
+        if ($u.Length -gt 32)                { Write-Warn "Username too long (max 32 chars)."; continue }
+        if ($u -notmatch '^[A-Za-z0-9_-]+$') { Write-Warn "Letters, numbers, hyphens, underscores only."; continue }
+        if (Test-ReservedScopeName $u) {
+            Write-Warn "Username '$u' clashes with a scope folder name ($($Script:ReservedScopeNames -join ', ')). Pick another."
+            continue
+        }
+        return $u
+    }
 }
 
 function Step-NasLayout {
@@ -850,41 +1046,8 @@ function Step-NasLayout {
         return
     }
 
-    Write-Host ""
-    Write-Host "Will more than one person share this NAS for retro-gaming sync?"
-    Write-Host ""
-    Write-Host "  [N] Single user (recommended for personal setups)"
-    Write-Host "      Files go directly under your NAS base directory."
-    Write-Host "      Example with base = /Retrosync:"
-    Write-Host "          /Retrosync/roms/<console>/..."
-    Write-Host "          /Retrosync/saves/..."
-    Write-Host "          /Retrosync/bios/..."
-    Write-Host ""
-    Write-Host "  [Y] Multiple users (e.g. you and a partner share the NAS)"
-    Write-Host "      Each person gets their own subfolder so saves stay separate."
-    Write-Host "      Example with base = /Retrosync:"
-    Write-Host "          /Retrosync/alice/roms/..."
-    Write-Host "          /Retrosync/alice/saves/..."
-    Write-Host "          /Retrosync/bob/roms/..."
-    Write-Host "      You'll be asked to pick a username next."
-    Write-Host ""
-    $Script:MultiUser = Read-PromptYn "Multi-user setup?" 'n'
-
-    if ($Script:MultiUser) {
-        Write-Host ""
-        Write-Host "Pick a name for your personal subfolder on the NAS."
-        Write-Host "Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars."
-        while ($true) {
-            $u = Read-Prompt "Username"
-            if ([string]::IsNullOrEmpty($u))     { Write-Warn "Username cannot be empty."; continue }
-            if ($u.Length -gt 32)                { Write-Warn "Username too long (max 32 chars)."; continue }
-            if ($u -notmatch '^[A-Za-z0-9_-]+$') { Write-Warn "Letters, numbers, hyphens, underscores only."; continue }
-            $Script:Username = $u
-            break
-        }
-        Write-Success "Username set: $Script:Username"
-    }
-
+    # 1. NAS base dir first - we need it before we can probe for existing
+    # users on the NAS, and the single/multi examples below also use it.
     Write-Host ""
     Write-Host "Enter the path Syncthing INSIDE the NAS will use for retro-data."
     Write-Host ""
@@ -899,17 +1062,6 @@ function Step-NasLayout {
     Write-Host "  Containerized examples:  /Retrosync   /data/emulation"
     Write-Host "  Native install examples: /mnt/tank/retro-data   /srv/sync"
     Write-Host ""
-    Write-Host "If you enter /Retrosync, files will end up (as Syncthing sees them) at:"
-    if ($Script:MultiUser) {
-        Write-Host "    /Retrosync/$Script:Username/roms/<console>/..."
-        Write-Host "    /Retrosync/$Script:Username/saves/..."
-        Write-Host "    /Retrosync/$Script:Username/bios/..."
-    } else {
-        Write-Host "    /Retrosync/roms/<console>/..."
-        Write-Host "    /Retrosync/saves/..."
-        Write-Host "    /Retrosync/bios/..."
-    }
-    Write-Host ""
     while ($true) {
         $base = Read-Prompt "Base directory on NAS (container-internal)" "/Retrosync"
         if ([string]::IsNullOrEmpty($base) -or $base.Substring(0,1) -ne '/') {
@@ -919,6 +1071,91 @@ function Step-NasLayout {
         $Script:NasBaseDir = $base.TrimEnd('/')
         break
     }
+
+    # 2. Single vs multi-user.
+    Write-Host ""
+    Write-Host "Will more than one person share this NAS for retro-gaming sync?"
+    Write-Host ""
+    Write-Host "  [N] Single user (recommended for personal setups)"
+    Write-Host "      Files go directly under your NAS base directory:"
+    Write-Host "          $Script:NasBaseDir/roms/<console>/..."
+    Write-Host "          $Script:NasBaseDir/saves/..."
+    Write-Host "          $Script:NasBaseDir/bios/..."
+    Write-Host ""
+    Write-Host "  [Y] Multiple users (e.g. you and a partner share the NAS, OR you're"
+    Write-Host "      adding a new device to a setup that's already multi-user)"
+    Write-Host "      Each user gets their own subfolder so saves stay separate:"
+    Write-Host "          $Script:NasBaseDir/alice/roms/..."
+    Write-Host "          $Script:NasBaseDir/bob/roms/..."
+    Write-Host "      You'll be asked to pick an existing user from the NAS, or"
+    Write-Host "      create a new one."
+    Write-Host ""
+    $Script:MultiUser = Read-PromptYn "Multi-user setup?" 'n'
+
+    if ($Script:MultiUser) {
+        # 3. Probe the NAS Syncthing config for existing users and present
+        # them as numbered choices. This makes "add this device to my existing
+        # linux user" trivial - pick a number instead of retyping the name
+        # (and risking a capitalization mismatch).
+        Write-Host ""
+        Write-Info "Checking $Script:NasBaseDir on the NAS for existing users..."
+
+        if (Test-NasSingleUserFolders) {
+            Write-Host ""
+            Write-WarnBlock @(
+                "This NAS already has single-user folders (e.g. roms, bios)",
+                "directly under $Script:NasBaseDir. Adding multi-user folders",
+                "alongside them is allowed and won't break anything, but the",
+                "resulting layout will be mixed - some data at",
+                "$Script:NasBaseDir/<scope>, other data at",
+                "$Script:NasBaseDir/<username>/<scope>. To clean up, the",
+                "original single-user folders would need migrating by hand",
+                "on the NAS."
+            )
+        }
+
+        $existing = @(Get-NasUsers)
+
+        if ($existing.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Found $($existing.Count) existing user(s) on the NAS:"
+            Write-Host ""
+            for ($i = 0; $i -lt $existing.Count; $i++) {
+                "{0,4}  {1,-32} ({2} folder(s))" -f "[$($i+1)]", $existing[$i].User, $existing[$i].Count |
+                    ForEach-Object { Write-Host $_ }
+            }
+            $newChoice = $existing.Count + 1
+            "{0,4}  Create new user" -f "[$newChoice]" | ForEach-Object { Write-Host $_ }
+            Write-Host ""
+            $choice = $null
+            while ($true) {
+                $raw = Read-Prompt "Choice" "1"
+                if ($raw -match '^\d+$') {
+                    $n = [int]$raw
+                    if ($n -ge 1 -and $n -le $newChoice) { $choice = $n; break }
+                }
+                Write-Warn "  Pick a number between 1 and $newChoice."
+            }
+            if ($choice -eq $newChoice) {
+                Write-Host ""
+                Write-Host "Pick a name for your new subfolder on the NAS."
+                Write-Host "Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars."
+                $Script:Username = Read-NewUsername
+            } else {
+                $Script:Username = $existing[$choice - 1].User
+                $Script:JoinedExistingUser = $true
+                Write-Info "Joining existing user: $Script:Username"
+            }
+        } else {
+            Write-Host ""
+            Write-Host "No existing users found under $Script:NasBaseDir on the NAS."
+            Write-Host "Pick a name for your new subfolder."
+            Write-Host "Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars."
+            $Script:Username = Read-NewUsername
+        }
+        Write-Success "Username set: $Script:Username"
+    }
+
     Write-Success "NAS base set: $(Get-NasUserRoot)"
 }
 
@@ -1292,6 +1529,13 @@ function Step-SyncScope {
 
 $Script:RomsIncluded = @()
 $Script:RomsExcluded = @()
+# Per-game selections for partially-synced consoles. Each entry is a
+# PSCustomObject { Console; Game }. A console appearing here syncs ONLY the
+# listed games; the rest go to .stignore. Built by Invoke-RomsGamePicker.
+$Script:RomsGameSelected = @()
+# Directory holding console subdirs, set by Step-RomsPicker so the game picker
+# can rescan individual consoles.
+$Script:RomsDir = ''
 
 function Test-LargeRomConsole {
     param([string]$ConsoleId)
@@ -1308,23 +1552,23 @@ function Get-LargeRomMessage {
 function Step-RomsPicker {
     if ($Script:SelectedScopes -notcontains 'roms') { return }
 
-    $romsDir = if ($Script:Frontend -eq 'custom') {
+    $Script:RomsDir = if ($Script:Frontend -eq 'custom') {
         $Script:CustomRomsPath
     } else {
         Join-Path $Script:FrontendBase $Script:RB_ROMS_SUB
     }
-    if (-not (Test-Path -LiteralPath $romsDir)) {
-        Write-Warn "ROMs directory not found: $romsDir"
+    if (-not (Test-Path -LiteralPath $Script:RomsDir)) {
+        Write-Warn "ROMs directory not found: $Script:RomsDir"
         Write-Warn "Skipping per-console picker. All console subdirs will sync once they exist."
         return
     }
 
-    $consoles = Get-ChildItem -LiteralPath $romsDir -Directory -ErrorAction SilentlyContinue |
+    $consoles = Get-ChildItem -LiteralPath $Script:RomsDir -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name |
                 Select-Object -ExpandProperty Name
 
     if ($consoles.Count -eq 0) {
-        Write-Info "No console subdirectories yet in $romsDir - all will sync as they appear."
+        Write-Info "No console subdirectories yet in $Script:RomsDir - all will sync as they appear."
         return
     }
 
@@ -1334,30 +1578,69 @@ function Step-RomsPicker {
     if (Read-PromptYn "Sync ALL consoles to NAS?" 'y') {
         $Script:RomsIncluded = @($consoles)
         Write-Success "Syncing all $($consoles.Count) consoles."
-        return
+    } else {
+        Write-Host ""
+        Write-Host "Pick which consoles to sync. Excluded ones go to .stignore on THIS"
+        Write-Host "device only - your NAS still gets them from your other devices."
+        Write-Host "Some systems show a [!] size warning, but the default is still 'y' so"
+        Write-Host "you don't accidentally skip them by pressing Enter."
+        Write-Host ""
+
+        foreach ($c in $consoles) {
+            $warnText  = ''
+            if (Test-LargeRomConsole $c) {
+                $warnText = "  [!] $(Get-LargeRomMessage $c)"
+            }
+            if (Read-PromptYn "    $c$warnText" 'y') {
+                $Script:RomsIncluded += $c
+            } else {
+                $Script:RomsExcluded += $c
+            }
+        }
+
+        if ($Script:RomsExcluded.Count -gt 0) {
+            Write-Info "Excluded on this device: $($Script:RomsExcluded -join ', ')"
+        }
     }
 
-    Write-Host ""
-    Write-Host "Pick which consoles to sync. Excluded ones go to .stignore on THIS"
-    Write-Host "device only - your NAS still gets them from your other devices."
-    Write-Host "Some systems show a [!] size warning, but the default is still 'y' so"
-    Write-Host "you don't accidentally skip them by pressing Enter."
-    Write-Host ""
+    # Offer per-game selection for any large console we're going to sync.
+    Invoke-RomsGamePicker
+}
 
-    foreach ($c in $consoles) {
-        $warnText  = ''
-        if (Test-LargeRomConsole $c) {
-            $warnText = "  [!] $(Get-LargeRomMessage $c)"
+# For each large included console, offer "sync all games" or "pick specific
+# games." Picking specific games records them in $Script:RomsGameSelected; the
+# rest of that console's contents go to .stignore. Small consoles are never
+# prompted (not worth the friction).
+function Invoke-RomsGamePicker {
+    foreach ($c in $Script:RomsIncluded) {
+        if (-not (Test-LargeRomConsole $c)) { continue }
+
+        $consoleDir = Join-Path $Script:RomsDir $c
+        # One level under the console dir: each entry (file OR folder) is a
+        # candidate "game." PS3/RPCS3 rips are folders; most others are files.
+        $games = Get-ChildItem -LiteralPath $consoleDir -ErrorAction SilentlyContinue |
+                 Sort-Object Name |
+                 Select-Object -ExpandProperty Name
+        if (-not $games -or $games.Count -eq 0) { continue }
+
+        Write-Host ""
+        Write-Host "Console '$c' has $($games.Count) item(s)  ($(Get-LargeRomMessage $c))."
+        if (Read-PromptYn "Sync ALL $c games?" 'y') {
+            continue   # whole console synced; no .stignore entries needed
         }
-        if (Read-PromptYn "    $c$warnText" 'y') {
-            $Script:RomsIncluded += $c
-        } else {
+
+        $picked = @(Show-MultiSelect -Prompt "Select $c games to sync (the rest stay on the NAS only):" -Items @($games))
+
+        if ($picked.Count -eq 0) {
             $Script:RomsExcluded += $c
+            Write-Warn "No $c games selected - excluding the whole console on this device."
+            continue
         }
-    }
 
-    if ($Script:RomsExcluded.Count -gt 0) {
-        Write-Info "Excluded on this device: $($Script:RomsExcluded -join ', ')"
+        foreach ($g in $picked) {
+            $Script:RomsGameSelected += [PSCustomObject]@{ Console = $c; Game = $g }
+        }
+        Write-Success "Syncing $($picked.Count) of $($games.Count) $c games."
     }
 }
 
@@ -1486,6 +1769,7 @@ function Step-SavesPicker {
 # -----------------------------------------------------------------------------
 
 $Script:DefaultDirection    = 'sendreceive'
+$Script:ModeDefault         = 'sendreceive'  # default in per-folder direction prompts
 $Script:IgnorePerms         = $true
 $Script:PerFolderDirection  = @{}  # key -> direction
 
@@ -1536,50 +1820,83 @@ function Step-IgnorePerms {
     $Script:IgnorePerms = Read-PromptYn "Ignore permissions? (recommended)" 'y'
 }
 
+# Decide DefaultDirection + ModeDefault based on context: are we joining an
+# existing user, creating a new user, or doing a single-user setup? This runs
+# right after Step-NasLayout so the user resolves the role question early
+# (before the scope/saves pickers) and the picker has the right defaults.
+function Step-SetupRole {
+    # Re-runs skip this entirely - the saved profile already has every folder's
+    # direction. Step-SyncDirection offers to change them at the end.
+    if ($Script:ExistingProfile) { return }
+
+    # Multi-user, joined existing user via the picker -> adding by definition.
+    if ($Script:JoinedExistingUser) {
+        $Script:DefaultDirection = 'receiveonly'
+        $Script:ModeDefault      = 'receiveonly'
+        Write-Host ""
+        Write-Info "Joining an existing user automatically sets sync direction to Receive only -"
+        Write-Info "this device pulls the existing NAS data down first. After the first full sync"
+        Write-Info "completes, re-run the script and pick a Two-way direction at the prompt."
+        return
+    }
+
+    # Multi-user, creating a new user -> no prior devices for this user, so
+    # treat as first device.
+    if ($Script:MultiUser) {
+        $Script:DefaultDirection = 'sendreceive'
+        $Script:ModeDefault      = 'sendreceive'
+        Write-Host ""
+        Write-Info "New user '$Script:Username' on the NAS - this is the first device for that user."
+        Write-Info "Sync direction defaults to Two-way (push and pull)."
+        return
+    }
+
+    # Single-user: ask. If the NAS already has single-user folders configured,
+    # default to "Adding" since that's almost certainly the right answer.
+    Write-Host ""
+    Write-Host "Is this your first device, or are you adding this device to an"
+    Write-Host "existing NAS-based RetroSync setup?"
+    Write-Host ""
+    Write-Host "    [1] First device - the NAS is empty, or this device's files"
+    Write-Host "        should be the starting copy that other devices pull from."
+    Write-Host "        Default sync direction: Two-way."
+    Write-Host ""
+    Write-Host "    [2] Adding to an existing setup - the NAS already has data from"
+    Write-Host "        another device. Pull NAS data DOWN first; do NOT push this"
+    Write-Host "        device's existing files up. Default direction: Receive only."
+    Write-Host "        After the first full sync completes, re-run this script and"
+    Write-Host "        pick a Two-way direction at the prompt to enable two-way."
+    Write-Host ""
+    $defaultChoice = '1'
+    if (Test-NasSingleUserFolders) {
+        Write-Info "  (The NAS already has single-user folders configured. If those were"
+        Write-Info "   set up by another device, [2] Adding is probably right.)"
+        $defaultChoice = '2'
+    }
+    $modeChoice = Read-Prompt "Choice" $defaultChoice
+    if ($modeChoice -eq '2') {
+        $Script:DefaultDirection = 'receiveonly'
+        $Script:ModeDefault      = 'receiveonly'
+        Write-Host ""
+        Write-Info "Sync direction set to Receive only."
+    } else {
+        $Script:DefaultDirection = 'sendreceive'
+        $Script:ModeDefault      = 'sendreceive'
+    }
+}
+
 function Step-SyncDirection {
-    $modeDefault = 'sendreceive'
+    # The first-device-vs-adding question was answered by Step-SetupRole
+    # (or skipped on re-run with EXISTING_PROFILE). This step just confirms
+    # the resolved DefaultDirection and optionally lets the user override
+    # per-folder.
 
     if ($Script:ExistingProfile) {
-        # Re-run on a saved profile: the first-vs-adding distinction was
-        # answered last time. Re-asking it would be confusing (e.g. a user
-        # who picked "Adding" originally would have to lie and pick
-        # "First device" just to flip to two-way). Skip straight to the
-        # direction picker.
+        # Re-run: re-pick the default direction. Per-folder direction is
+        # already saved per folder in the profile; only newly-added folders
+        # need a fresh DefaultDirection.
         $Script:DefaultDirection = Get-SyncDirection 'all folders (default)' 'sendreceive'
-    } else {
-        Write-Host ""
-        Write-Host "Is this your first device, or are you adding this device to an"
-        Write-Host "existing NAS-based RetroSync setup?"
-        Write-Host ""
-        Write-Host "    [1] First device - the NAS is empty, or this device's files"
-        Write-Host "        should be the starting copy that other devices pull from."
-        Write-Host "        Default sync direction: Two-way."
-        Write-Host ""
-        Write-Host "    [2] Adding to an existing setup - the NAS already has data from"
-        Write-Host "        another device. Pull NAS data DOWN first; do NOT push this"
-        Write-Host "        device's existing files up. Default direction: Receive only."
-        Write-Host "        After the first full sync completes, you'll need to flip"
-        Write-Host "        folders to Two-way so future edits go both ways. Two ways"
-        Write-Host "        to do that:"
-        Write-Host "          - In the Syncthing web UI: open each folder -> Edit ->"
-        Write-Host "            Folder Type -> 'Send & Receive' -> Save."
-        Write-Host "          - Or re-run this script (it skips this question on"
-        Write-Host "            re-runs and goes straight to the direction picker)."
-        Write-Host ""
-        $modeChoice = Read-Prompt "Choice" "1"
-
-        if ($modeChoice -eq '2') {
-            # "Adding to existing setup" already implies receive-only - asking
-            # for a direction next would just contradict the choice the user
-            # already made. Lock it in and move on.
-            $Script:DefaultDirection = 'receiveonly'
-            $modeDefault = 'receiveonly'
-            Write-Host ""
-            Write-Info "Sync direction set to Receive only (matches 'Adding' choice)."
-        } else {
-            $modeDefault = 'sendreceive'
-            $Script:DefaultDirection = Get-SyncDirection 'all folders (default)' $modeDefault
-        }
+        $Script:ModeDefault      = $Script:DefaultDirection
     }
 
     if (Read-PromptYn "Apply this direction to ALL folders?" 'y') {
@@ -1588,7 +1905,7 @@ function Step-SyncDirection {
             Write-Info "Reminder: after the first full sync finishes (watch progress at"
             Write-Info "  $Script:SyncthingLocalDefault), flip folders to Two-way. Either:"
             Write-Info "    - Web UI: each folder -> Edit -> Folder Type -> 'Send & Receive'."
-            Write-Info "    - Or re-run this script: pick [1] Update at the profile"
+            Write-Info "    - Or re-run this script: pick [2] Update at the profile"
             Write-Info "      prompt, then pick [1] Two-way at the direction prompt."
         }
         return
@@ -1596,10 +1913,10 @@ function Step-SyncDirection {
 
     foreach ($entry in $Script:SyncScopeDefinitions) {
         if ($Script:SelectedScopes -notcontains $entry.Key) { continue }
-        $Script:PerFolderDirection[$entry.Key] = Get-SyncDirection $entry.Label $modeDefault
+        $Script:PerFolderDirection[$entry.Key] = Get-SyncDirection $entry.Label $Script:ModeDefault
     }
     foreach ($s in $Script:SelectedSaves) {
-        $Script:PerFolderDirection["save-$($s.ConsoleId)"] = Get-SyncDirection $s.Label $modeDefault
+        $Script:PerFolderDirection["save-$($s.ConsoleId)"] = Get-SyncDirection $s.Label $Script:ModeDefault
     }
 }
 
@@ -1919,12 +2236,59 @@ function Set-FolderIgnores {
     }
 }
 
+# Write already-formed .stignore lines verbatim (used for the roms folder where
+# patterns include "!" negations and "**" globs whose ordering matters).
+function Set-FolderIgnoreLines {
+    param([string]$Id, [string[]]$Lines)
+    if (-not $Lines -or $Lines.Count -eq 0) { return }
+    $body = @(
+        "// Auto-generated by $Script:RetroSyncName - do not edit manually",
+        "// To update, re-run $(Split-Path -Leaf $PSCommandPath)"
+    ) + $Lines
+    $json = @{ ignore = $body } | ConvertTo-Json
+    if ($DryRun) {
+        Write-Dry "Would write .stignore for $Id ($($Lines.Count) line(s)):"
+        foreach ($l in $Lines) { Write-Dry "    $l" }
+        return
+    }
+    try {
+        Invoke-SyncthingPost 'local' "/db/ignores?folder=$Id" $json | Out-Null
+    } catch {
+        Write-Warn "Failed to write .stignore for $Id"
+    }
+}
+
+# Produce the ordered .stignore lines for the roms folder from $Script:RomsExcluded
+# (whole-console exclusions) and $Script:RomsGameSelected (per-game inclusions).
+# Include ("!") lines MUST come before the matching ignore lines - Syncthing
+# matches top-down, first match wins - so all includes are emitted first.
+function Get-RomsIgnoreLines {
+    $includes = @()
+    $excludes = @()
+    $partial  = @{}
+    foreach ($sel in $Script:RomsGameSelected) {
+        $c = $sel.Console
+        $g = $sel.Game
+        $partial[$c] = $true
+        # Two lines per game: the entry itself, and (for folder-style games)
+        # everything beneath it.
+        $includes += "!/$c/$g"
+        $includes += "!/$c/$g/**"
+    }
+    # Ignore the non-selected remainder of each partial console.
+    foreach ($c in $partial.Keys) { $excludes += "/$c/**" }
+    # Fully-excluded consoles: ignore the whole directory.
+    foreach ($c in $Script:RomsExcluded) { $excludes += "/$c" }
+    return @($includes + $excludes)
+}
+
 $Script:AppliedFolders = @()  # array of PSCustomObject
 
 function New-ProvisionedFolder {
     param(
         [string]$Key, [string]$Label, [string]$LocalPath, [string]$NasPath,
-        [bool]$Versioning, [string[]]$IgnorePatterns
+        [bool]$Versioning, [string[]]$IgnorePatterns,
+        [string[]]$RawIgnoreLines = @()
     )
     $id = Get-FolderId $Key
     $direction = Get-DirectionFor $Key
@@ -1944,8 +2308,15 @@ function New-ProvisionedFolder {
         Write-Err "Skipping ${Label}: $($_.Exception.Message)"
         return
     }
-    if ($IgnorePatterns -and $IgnorePatterns.Count -gt 0) {
+    # Prefer the raw-lines channel (supports "!" includes + ordering); fall
+    # back to the legacy bare-name channel (each prefixed with "/").
+    $storedIgnores = @()
+    if ($RawIgnoreLines -and $RawIgnoreLines.Count -gt 0) {
+        Set-FolderIgnoreLines -Id $id -Lines $RawIgnoreLines
+        $storedIgnores = $RawIgnoreLines
+    } elseif ($IgnorePatterns -and $IgnorePatterns.Count -gt 0) {
         Set-FolderIgnores -Id $id -Patterns $IgnorePatterns
+        $storedIgnores = @($IgnorePatterns | ForEach-Object { "/$_" })
     }
     $extra = if ($Versioning) { ', 5-version retention' } else { '' }
     Write-Success "  -> $Label configured ($direction$extra)"
@@ -1956,7 +2327,7 @@ function New-ProvisionedFolder {
         NasPath        = $NasPath
         Direction      = $direction
         Versioning     = $Versioning
-        IgnorePatterns = $IgnorePatterns
+        IgnorePatterns = $storedIgnores
     }
 }
 
@@ -1983,13 +2354,14 @@ function Step-ApplyAll {
         # Save states get versioning - they're easy to corrupt and the user
         # benefits from being able to roll back.
         if ($entry.Key -like '*states*') { $versioning = $true }
-        $ignores = @()
-        if ($entry.Key -eq 'roms' -and $Script:RomsExcluded.Count -gt 0) {
-            $ignores = $Script:RomsExcluded
+        $rawLines = @()
+        if ($entry.Key -eq 'roms') {
+            $rawLines = @(Get-RomsIgnoreLines)
         }
         New-ProvisionedFolder -Key $entry.Key -Label $entry.Label `
                               -LocalPath $localPath -NasPath $nasPath `
-                              -Versioning $versioning -IgnorePatterns $ignores
+                              -Versioning $versioning -IgnorePatterns @() `
+                              -RawIgnoreLines $rawLines
     }
 
     foreach ($s in $Script:SelectedSaves) {
@@ -2042,6 +2414,13 @@ function Write-Summary {
         Write-Host ""
         Write-Host "  ROM consoles excluded on this device:"
         Write-Host "    $($Script:RomsExcluded -join ', ')"
+    }
+    if ($Script:RomsGameSelected.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Consoles syncing only selected games on this device:"
+        $Script:RomsGameSelected | Group-Object Console | ForEach-Object {
+            "{0,-12} {1} game(s)" -f $_.Name, $_.Count | ForEach-Object { Write-Host "    $_" }
+        }
     }
     Write-Host ""
     Write-Host "  Syncthing is now syncing in the background."
@@ -2384,6 +2763,7 @@ function Invoke-Main {
     Step-FrontendSelection
     Step-NasConnection
     Step-NasLayout
+    Step-SetupRole
     Step-SyncScope
     Step-RomsPicker
     Step-SavesPicker

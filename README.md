@@ -1,14 +1,14 @@
 # Retrosync
 Retrosync is a script that automates the process of creating syncthing connections to sync/backup your roms, bios, saves, states, ES-DE gamelists and media.
 
-> **Note:** To be fully transperent, this project is made using artificial intelligence, I welcome any help or even taking over the project. Currently the project depends on the user already having syncthing running in the background, and it only designed with RetroDECK and RetroBat file structure in mind. In the future it could be a full on app and container stack.
+> **Note:** To be fully transperent, this project is made using artificial intelligence, I welcome any help or even taking over the project. Currently the project depends on the user already having syncthing running in the background. It auto-detects RetroDECK and RetroBat layouts, and a custom-locations mode handles any other frontend or folder layout. In the future it could be a full on app and container stack.
 
 Configure [Syncthing](https://syncthing.net) to keep your retro gaming files —
 ROMs, BIOS, saves, save states, and ES-DE metadata — in sync between your
 client devices and a central NAS hub. One interactive setup, idempotent
 re-runs, and the GUI stays untouched.
 
-> **Status:** v0.3.1 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing.
+> **Status:** v0.4.0 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing. Highlights since v0.3.0: **per-game selective sync** (check off exactly which games to sync from a big console folder via a terminal checkbox — no need to mirror 80 GB of PS3 games to a Steam Deck), an **existing-user picker** for multi-user setups, a read-only **"show current configuration"** view, and a **custom locations** mode that works with any frontend or layout. Please open an issue if anything breaks. Feel free to contribute or build on the idea.
 
 ---
 
@@ -35,13 +35,13 @@ duplicates.
 
 ---
 
-## v0.3.0 scope
+## Supported frontends
 
 | Frontend | Status |
 |---|---|
 | RetroBat (Windows)                     | ✅ Supported (Stable) |
 | RetroDECK (Linux Flatpak)              | ✅ Supported (Testing) |
-| **Custom locations (any frontend, any layout)** | ✅ **New in v0.3.0** |
+| **Custom locations (any frontend, any layout)** | ✅ Supported |
 | EmuDeck (Linux)                        | 🔜 Planned (works today via custom mode) |
 | EmuDeck (Windows)                      | 🔜 Planned (works today via custom mode) |
 | Standalone ES-DE                       | ✅ Works via custom mode |
@@ -54,6 +54,43 @@ This makes RetroSync work with any frontend, any folder layout, or no
 frontend at all — at the cost of typing the paths yourself instead of
 having them auto-detected. Pick option `[2] Custom locations` when the
 script asks which frontend you're using.
+
+---
+
+## Selective sync: choose exactly which games to sync
+
+A console folder can be huge — 80+ GB of PS3 rips, for instance — and you
+rarely want all of it on every device. RetroSync lets you sync **specific
+games** instead of a whole console.
+
+When you choose to sync a **large** console (PS3, PS2, Switch, Wii, Wii U,
+Xbox, Xbox 360), the script asks whether to sync *all* its games or *pick*.
+Choose "pick" and you get a terminal checkbox:
+
+```text
+Select ps3 games to sync (the rest stay on the NAS only):
+  ↑/↓ move · SPACE toggle · a=all · n=none · ENTER confirm
+
+  > [x] Demon's Souls
+    [ ] God of War III
+    [x] Persona 5
+    [ ] Gran Turismo 6
+    ...
+  2 of 47 selected
+```
+
+Arrow keys move, **space** toggles, **a** selects all, **n** none, **enter**
+confirms. The games you leave unchecked stay on the NAS — they just don't
+download to *this* device. Under the hood this is implemented with Syncthing
+`.stignore` include rules, so it's a normal Syncthing folder; nothing custom
+on the protocol side.
+
+- Works on every platform with **no extra dependencies** — pure terminal on
+  Linux (including Steam Deck Game Mode and over SSH), native console on
+  Windows PowerShell 5.1. No `dialog`, `whiptail`, or `fzf` needed.
+- Small consoles are never prompted — only the big ones, so you're not
+  answering "all or pick?" for your NES library.
+- Non-interactive / piped runs select everything automatically (no hang).
 
 ---
 
@@ -220,14 +257,20 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 1. **Pre-flight.** Checks shell version, required tools, Syncthing reachable
    on `localhost:8384`, and auto-extracts your local Syncthing API key from
    `config.xml`.
-2. **Profile detection.** If you've run RetroSync before, four options:
-   - `[1] Update` — add/change folders, keep existing config
-   - `[2] Start fresh` — delete profile, reconfigure from scratch
-   - `[3] Remove this device from sync` — clean up Syncthing configs on this
+2. **Profile detection.** If you've run RetroSync before, five options:
+   - `[1] Show current configuration` — read-only view of what was set up last
+     time (frontend, NAS address, API-key storage mode, sync ports, and every
+     configured folder with its direction, versioning, paths, and ignore
+     patterns). Returns to the menu when done.
+   - `[2] Update` — add/change folders, keep existing config
+   - `[3] Start fresh` — delete this device's local `profile.json` and
+     reconfigure. Does **not** touch Syncthing on either side — the folders
+     and pairings stay; pick `[4]` for that.
+   - `[4] Remove this device from sync` — clean up Syncthing configs on this
      device and on the NAS (unshares from other devices if any still use the
      folders, otherwise fully deletes); optionally delete local data and/or
      point you at the NAS data to delete manually
-   - `[4] Exit`
+   - `[5] Exit`
 3. **Frontend selection.** Pick `[1]` for RetroDECK (Linux) or RetroBat
    (Windows) — the script auto-detects the install path (parses
    `retrodeck.cfg` on Linux to find custom `rdhome=` locations) and lets
@@ -254,32 +297,46 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
      in per-user APPDATA on Windows. Simple; risk is accidental upload.
    - **Don't store** — re-prompted every run. Most secure, least convenient.
 6. **Multi-user / single-user.** Single-user (recommended for personal
-   setups) puts everything directly under `{nas_base}/`. Multi-user prompts
-   for a username and your data lives at `{nas_base}/{username}/`. Folder
-   IDs reflect the choice so different users on the same NAS don't collide.
-7. **Sync scope.** Pick what to sync: ROMs, BIOS, save states, ES-DE
+   setups) puts everything directly under `{nas_base}/`. Multi-user puts your
+   data at `{nas_base}/{username}/`. For multi-user, the script **probes the
+   NAS for existing users** (by reading the NAS Syncthing folder config) and
+   shows them as a numbered list so you can join one without retyping the name
+   (or fat-fingering its capitalisation) — or create a new user. Reserved
+   scope names (`roms`, `bios`, `saves`, …) are filtered out and can't be used
+   as usernames. If the NAS already has single-user folders, a warning
+   explains that adding a user creates a mixed layout.
+7. **Setup role.** Right after the layout choice: are you the first device, or
+   adding to an existing setup? The script infers this when it can — joining
+   an existing user defaults to *receive-only* (pull the NAS copy down first),
+   creating a new user defaults to *two-way*, and a single-user setup against a
+   NAS that already has data defaults to *adding*. You can always override.
+8. **Sync scope.** Pick what to sync: ROMs, BIOS, save states, ES-DE
    metadata, and per-emulator saves (PCSX2, DuckStation, RPCS3, Dolphin
    GC/Wii, Cemu, RyuBing, Azahar, Vita3K, xemu, Flycast, melonDS, MAME,
    Ruffle, PrimeHack). Save options are filtered to only emulators actually
    present on this device, but locations that don't exist yet still get a
    "sync anyway?" prompt so future installs are picked up automatically.
-8. **Per-console picker for ROMs.** First asks "Sync ALL consoles?" — if
+9. **Per-console picker for ROMs.** First asks "Sync ALL consoles?" — if
    yes, skip the picker. Otherwise lists every ROM subfolder and lets you
    exclude consoles per-device (e.g. skip PS3 ROMs on the Steam Deck — too
    big). Excluded consoles go into `.stignore` on this device only — the
    NAS still gets all your ROMs from your other devices.
-9. **Ignore permissions** toggle (default on). Cross-OS sync (Windows → ZFS
-   on TrueNAS, exFAT cards, Android) often stalls because the receiver
-   can't apply Unix mode bits. Default-on avoids that.
-10. **Sync direction.** First device or adding to existing? Adding defaults
-    to receive-only with a reminder to flip to two-way after first sync
-    completes. First-device picks Two-way / Send only / Receive only and
-    can apply per-folder.
-11. **Apply.** Idempotent create-or-update on both local and NAS Syncthing.
+10. **Per-game picker for large consoles.** For each *large* console you're
+    syncing (PS3, PS2, Switch, Wii, Wii U, Xbox, Xbox 360), the script asks
+    "Sync ALL games, or pick?" Picking opens a terminal checkbox (see
+    [Selective sync](#selective-sync-choose-exactly-which-games-to-sync)
+    above) so you sync only the games you check; the rest stay on the NAS.
+11. **Ignore permissions** toggle (default on). Cross-OS sync (Windows → ZFS
+    on TrueNAS, exFAT cards, Android) often stalls because the receiver
+    can't apply Unix mode bits. Default-on avoids that.
+12. **Sync direction.** Confirms the direction resolved in the setup-role
+    step and optionally lets you set it per-folder (Two-way / Send only /
+    Receive only).
+13. **Apply.** Idempotent create-or-update on both local and NAS Syncthing.
     Versioning automatically enabled on saves/states (5 versions kept).
     Existing device lists on folders are *merged*, not replaced, so adding
     a new device doesn't accidentally unshare existing ones.
-12. **Profile saved** to `~/.config/retrosync/profile.json` (Linux, chmod
+14. **Profile saved** to `~/.config/retrosync/profile.json` (Linux, chmod
     600) or `%APPDATA%\RetroSync\profile.json` (Windows, per-user APPDATA).
 
 ---
@@ -305,6 +362,27 @@ Syncthing GUI — RetroSync only pairs your client with the NAS.
 
 For single-user (the default), data goes directly under `{nas_base}/`
 without a username layer, and folder IDs are just `retrosync-<scope>`.
+
+**Adding a new device to an existing user.** When you pick multi-user, the
+script reads the NAS Syncthing config and lists the users it already knows
+about, with their folder counts:
+
+```text
+Found 2 existing user(s) on the NAS:
+
+    [1] Windows                            (8 folder(s))
+    [2] linux                              (5 folder(s))
+    [3] Create new user
+
+Choice [1]:
+```
+
+Pick the number to join that user — no need to remember the exact spelling or
+capitalisation. Joining an existing user automatically sets this device to
+*receive-only* first, so it pulls the existing data down rather than pushing
+over it. "Users" here means users that the script has provisioned Syncthing
+folders for; a bare directory you created by hand on the NAS won't appear
+(there's no Syncthing folder pointing at it yet).
 
 ---
 
@@ -395,11 +473,22 @@ re-asks the things that might change (sync scopes, direction).
       "nas_path": "/Retrosync/roms",
       "type": "sendreceive",
       "versioning": false,
-      "ignore_patterns": ["/ps3", "/wii"]
+      "ignore_patterns": [
+        "!/ps3/Demon's Souls",
+        "!/ps3/Demon's Souls/**",
+        "/ps3/**",
+        "/wii"
+      ]
     }
   ]
 }
 ```
+
+`ignore_patterns` are the literal `.stignore` lines written for that folder.
+Whole-console exclusions look like `/wii`. Per-game selections (from the
+selective-sync picker) use Syncthing include rules: `!/ps3/<game>` keeps a
+game, and `/ps3/**` ignores the rest of that console — includes come first
+because Syncthing matches top-down, first match wins.
 
 The `api_key` field depends on `api_key_storage`:
 
@@ -467,15 +556,21 @@ gracefully. If you're on an older version, upgrade and re-run.
 
 ## Known limitations
 
-- v0.3 supports RetroDECK and RetroBat with auto-detection, plus a
+- Supports RetroDECK and RetroBat with auto-detection, plus a
   custom-locations mode for any other frontend (EmuDeck, standalone ES-DE,
   Batocera, Lakka, plain RetroArch, custom layouts). First-class support
   for EmuDeck with auto-detection is planned.
 - In custom mode, re-running the script does not re-prompt for paths or
   let you add new emulator save folders interactively — it re-applies the
   paths from the saved profile. To add a new path, either edit
-  `profile.json` directly or use `[3] Remove this device from sync` and
+  `profile.json` directly or use `[4] Remove this device from sync` and
   re-setup.
+- The per-game picker is re-run each time (it rescans the console folder and
+  re-asks); selections aren't pre-filled from the previous run. The chosen
+  games are recorded in the folder's `ignore_patterns` for reference.
+- There is no graphical UI yet — setup is a terminal/PowerShell flow (the
+  game picker is a terminal checkbox, not a windowed dialog). A native
+  Windows GUI is planned.
 - The script does not install Syncthing for you. It assumes Syncthing is
   already running.
 - The script does not create the NAS-side mount path. You must mount your
@@ -508,4 +603,4 @@ PRs and issues welcome. Particularly useful would be:
 
 ## License
 
-[MIT](LICENSE)
+[GPL-3.0](LICENSE)

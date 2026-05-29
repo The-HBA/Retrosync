@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.3.2"
+readonly RETROSYNC_VERSION="0.4.0"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -304,6 +304,103 @@ prompt_secret() {
     IFS= read -rs reply
     printf '\n' >&2
     echo "$reply"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure-bash multiselect checkbox (no dialog/whiptail/fzf — works in SteamOS
+# Game Mode, over SSH, headless). Arrow keys move, SPACE toggles, a=all,
+# n=none, ENTER confirms. All UI goes to stderr so stdout stays clean; the
+# result is returned via the global TUI_SELECTED array.
+#
+# Usage: tui_multiselect "Prompt line" item1 item2 item3 ...
+#   On return, TUI_SELECTED holds the chosen items (defaults to all selected).
+# Non-interactive (no TTY): selects everything and returns immediately.
+# ─────────────────────────────────────────────────────────────────────────────
+TUI_SELECTED=()
+tui_multiselect() {
+    local prompt="$1"; shift
+    local items=("$@")
+    local n=${#items[@]}
+    TUI_SELECTED=()
+    (( n == 0 )) && return 0
+
+    # No interactive terminal → can't draw a checkbox. Select all (the safe
+    # default) and move on so automated/piped runs don't hang on read.
+    if [[ ! -t 0 ]] || [[ ! -t 2 ]]; then
+        TUI_SELECTED=("${items[@]}")
+        return 0
+    fi
+
+    local -a checked
+    local i
+    for ((i = 0; i < n; i++)); do checked[i]=1; done   # default: all on
+    local cursor=0
+
+    # Fixed-height viewport so long lists (e.g. 80 PS3 games) don't break the
+    # cursor-up redraw math when they exceed the terminal height.
+    local max_visible=15
+    (( n < max_visible )) && max_visible=$n
+    local total_lines=$(( max_visible + 4 ))   # 3 header lines + items + 1 footer
+    local first_draw=1
+    local key rest start selcount mark
+
+    while true; do
+        if [[ $first_draw -eq 1 ]]; then
+            first_draw=0
+        else
+            printf '\033[%dA' "$total_lines" >&2   # move cursor back to top of block
+        fi
+
+        # Compute the visible window around the cursor.
+        start=$(( cursor - max_visible / 2 ))
+        (( start < 0 )) && start=0
+        (( start > n - max_visible )) && start=$(( n - max_visible ))
+        (( start < 0 )) && start=0
+
+        {
+            printf '\033[2K%s\n' "$prompt"
+            printf '\033[2K  %s\n' "↑/↓ move · SPACE toggle · a=all · n=none · ENTER confirm"
+            printf '\033[2K\n'
+            for ((i = start; i < start + max_visible; i++)); do
+                if (( i < n )); then
+                    mark=" "; [[ ${checked[i]} -eq 1 ]] && mark="x"
+                    if [[ $i -eq $cursor ]]; then
+                        printf '\033[2K%s  > [%s] %s%s\n' "$C_CYAN" "$mark" "${items[i]}" "$C_RESET"
+                    else
+                        printf '\033[2K    [%s] %s\n' "$mark" "${items[i]}"
+                    fi
+                else
+                    printf '\033[2K\n'   # pad blank lines to keep height constant
+                fi
+            done
+            selcount=0
+            for ((i = 0; i < n; i++)); do [[ ${checked[i]} -eq 1 ]] && ((selcount++)); done
+            printf '\033[2K  %s%d of %d selected%s\n' "$C_GREY" "$selcount" "$n" "$C_RESET"
+        } >&2
+
+        IFS= read -rsn1 key || break
+        if [[ "$key" == $'\x1b' ]]; then
+            # Escape sequence — read the two trailing chars of an arrow key.
+            read -rsn2 -t 0.05 rest || rest=""
+            case "$rest" in
+                '[A') (( cursor > 0 ))     && ((cursor--)) ;;   # up
+                '[B') (( cursor < n - 1 )) && ((cursor++)) ;;   # down
+            esac
+        elif [[ "$key" == " " ]]; then
+            checked[cursor]=$(( 1 - checked[cursor] ))
+        elif [[ "$key" == "a" || "$key" == "A" ]]; then
+            for ((i = 0; i < n; i++)); do checked[i]=1; done
+        elif [[ "$key" == "n" || "$key" == "N" ]]; then
+            for ((i = 0; i < n; i++)); do checked[i]=0; done
+        elif [[ -z "$key" ]]; then
+            break   # ENTER (read -n1 returns empty on newline)
+        fi
+    done
+    printf '\n' >&2
+
+    for ((i = 0; i < n; i++)); do
+        [[ ${checked[i]} -eq 1 ]] && TUI_SELECTED+=("${items[i]}")
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1169,6 +1266,10 @@ restore_custom_state_from_profile() {
 
 MULTI_USER=0
 USERNAME=""
+# Set to 1 in step_nas_layout when the user picks an existing user from the
+# NAS-side picker. step_setup_role reads it to skip the first-device prompt
+# and default to receive-only direction.
+JOINED_EXISTING_USER=0
 
 folder_id_for() {
     local key="$1"
@@ -1185,6 +1286,92 @@ nas_user_root() {
     else
         echo "${NAS_BASE_DIR}"
     fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-user discovery — probe the NAS Syncthing config for existing users
+# ─────────────────────────────────────────────────────────────────────────────
+# Reserved top-level NAS subpaths the script creates for single-user setups.
+# A directory whose first path component (under NAS_BASE_DIR) matches one of
+# these is a *scope* folder, not a user folder.
+RESERVED_SCOPE_NAMES=(roms bios saves states gamelists media emulationstation)
+
+is_reserved_scope_name() {
+    local target="$1" name
+    for name in "${RESERVED_SCOPE_NAMES[@]}"; do
+        [[ "$name" == "$target" ]] && return 0
+    done
+    return 1
+}
+
+# Query the NAS Syncthing config and echo one line per distinct existing user
+# under NAS_BASE_DIR, tab-separated with the folder count for that user:
+#     alice<TAB>8
+#     bob<TAB>3
+# Empty output means no multi-user folders are configured.
+list_nas_users() {
+    local base folders
+    base="${NAS_BASE_DIR%/}"
+    folders="$(st_get nas "/config/folders" 2>/dev/null || echo '[]')"
+    [[ -z "$folders" || "$folders" == "null" ]] && folders='[]'
+
+    echo "$folders" | jq -r --arg base "$base" \
+        --argjson reserved '["roms","bios","saves","states","gamelists","media","emulationstation"]' '
+        [ .[]
+          | .path
+          | select(startswith($base + "/"))
+          | ltrimstr($base + "/")
+          | split("/")[0]
+          | select(length > 0)
+          | select(. as $c | $reserved | index($c) == null)
+        ]
+        | group_by(.)
+        | map({user: .[0], count: length})
+        | sort_by(.user)
+        | .[]
+        | "\(.user)\t\(.count)"
+    ' 2>/dev/null || true
+}
+
+# Returns 0 if the NAS has any folder configured at a single-user-style path
+# (first component under NAS_BASE_DIR matches a reserved scope name).
+nas_has_single_user_folders() {
+    local base folders
+    base="${NAS_BASE_DIR%/}"
+    folders="$(st_get nas "/config/folders" 2>/dev/null || echo '[]')"
+    [[ -z "$folders" || "$folders" == "null" ]] && folders='[]'
+
+    echo "$folders" | jq -e --arg base "$base" \
+        --argjson reserved '["roms","bios","saves","states","gamelists","media","emulationstation"]' '
+        any(.[] | .path
+              | select(startswith($base + "/"))
+              | ltrimstr($base + "/")
+              | split("/")[0];
+            . as $c | $reserved | index($c) != null)
+    ' >/dev/null 2>&1
+}
+
+# Prompt for a new username until input is valid. Echoes the chosen name.
+prompt_new_username() {
+    local u
+    while true; do
+        u="$(prompt "Username")"
+        if [[ -z "$u" ]]; then
+            warn "Username cannot be empty." >&2; continue
+        fi
+        if [[ ${#u} -gt 32 ]]; then
+            warn "Username too long (max 32 chars)." >&2; continue
+        fi
+        if [[ ! "$u" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            warn "Letters, numbers, hyphens, underscores only." >&2; continue
+        fi
+        if is_reserved_scope_name "$u"; then
+            warn "Username '$u' clashes with a scope folder name (${RESERVED_SCOPE_NAMES[*]}). Pick another." >&2
+            continue
+        fi
+        echo "$u"
+        return 0
+    done
 }
 
 step_nas_layout() {
@@ -1214,53 +1401,8 @@ step_nas_layout() {
         return 0
     fi
 
-    echo
-    cat <<EOF
-Will more than one person share this NAS for retro-gaming sync?
-
-  [N] Single user (recommended for personal setups)
-      Files go directly under your NAS base directory.
-      Example with base = /Retrosync:
-          /Retrosync/roms/<console>/...
-          /Retrosync/saves/...
-          /Retrosync/bios/...
-
-  [Y] Multiple users (e.g. you and a partner share the NAS)
-      Each person gets their own subfolder so saves stay separate.
-      Example with base = /Retrosync:
-          /Retrosync/alice/roms/...
-          /Retrosync/alice/saves/...
-          /Retrosync/bob/roms/...
-      You'll be asked to pick a username next.
-EOF
-    if prompt_yn "Multi-user setup?" "n"; then
-        MULTI_USER=1
-    else
-        MULTI_USER=0
-    fi
-
-    if [[ $MULTI_USER -eq 1 ]]; then
-        echo
-        cat <<EOF
-Pick a name for your personal subfolder on the NAS.
-Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars.
-EOF
-        while true; do
-            USERNAME="$(prompt "Username")"
-            if [[ -z "$USERNAME" ]]; then
-                warn "Username cannot be empty."; continue
-            fi
-            if [[ ${#USERNAME} -gt 32 ]]; then
-                warn "Username too long (max 32 chars)."; continue
-            fi
-            if [[ ! "$USERNAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
-                warn "Letters, numbers, hyphens, underscores only."; continue
-            fi
-            break
-        done
-        success "Username set: ${USERNAME}"
-    fi
-
+    # 1. NAS base dir first — we need it before we can probe for existing
+    # users on the NAS, and the single/multi examples below also use it.
     echo
     echo "Enter the path Syncthing INSIDE the NAS will use for retro-data."
     echo
@@ -1274,17 +1416,6 @@ EOF
     echo "  Containerized examples:  /Retrosync   /data/emulation"
     echo "  Native install examples: /mnt/tank/retro-data   /srv/sync"
     echo
-    echo "If you enter /Retrosync, files will end up (as Syncthing sees them) at:"
-    if [[ $MULTI_USER -eq 1 ]]; then
-        echo "    /Retrosync/${USERNAME}/roms/<console>/..."
-        echo "    /Retrosync/${USERNAME}/saves/..."
-        echo "    /Retrosync/${USERNAME}/bios/..."
-    else
-        echo "    /Retrosync/roms/<console>/..."
-        echo "    /Retrosync/saves/..."
-        echo "    /Retrosync/bios/..."
-    fi
-    echo
     while true; do
         NAS_BASE_DIR="$(prompt "Base directory on NAS (container-internal)" "/Retrosync")"
         if [[ -z "$NAS_BASE_DIR" ]] || [[ "${NAS_BASE_DIR:0:1}" != "/" ]]; then
@@ -1294,6 +1425,103 @@ EOF
         NAS_BASE_DIR="${NAS_BASE_DIR%/}"
         break
     done
+
+    # 2. Single vs multi-user.
+    echo
+    cat <<EOF
+Will more than one person share this NAS for retro-gaming sync?
+
+  [N] Single user (recommended for personal setups)
+      Files go directly under your NAS base directory:
+          ${NAS_BASE_DIR}/roms/<console>/...
+          ${NAS_BASE_DIR}/saves/...
+          ${NAS_BASE_DIR}/bios/...
+
+  [Y] Multiple users (e.g. you and a partner share the NAS, OR you're
+      adding a new device to a setup that's already multi-user)
+      Each user gets their own subfolder so saves stay separate:
+          ${NAS_BASE_DIR}/alice/roms/...
+          ${NAS_BASE_DIR}/bob/roms/...
+      You'll be asked to pick an existing user from the NAS, or create
+      a new one.
+EOF
+    if prompt_yn "Multi-user setup?" "n"; then
+        MULTI_USER=1
+    else
+        MULTI_USER=0
+    fi
+
+    if [[ $MULTI_USER -eq 1 ]]; then
+        # 3. Probe the NAS Syncthing config for existing users and present
+        # them as numbered choices. This makes "add this device to my existing
+        # linux user" trivial — pick a number instead of retyping the name
+        # (and risking a capitalization mismatch).
+        echo
+        info "Checking ${NAS_BASE_DIR} on the NAS for existing users..."
+
+        if nas_has_single_user_folders; then
+            echo
+            warn "This NAS already has single-user folders (e.g. roms, bios)
+   directly under ${NAS_BASE_DIR}. Adding multi-user folders alongside
+   them is allowed and won't break anything, but the resulting layout
+   will be mixed — some data at ${NAS_BASE_DIR}/<scope>, other data at
+   ${NAS_BASE_DIR}/<username>/<scope>. To clean up, the original
+   single-user folders would need migrating by hand on the NAS."
+        fi
+
+        local users_raw
+        users_raw="$(list_nas_users)"
+
+        local -a user_names=() user_counts=()
+        if [[ -n "$users_raw" ]]; then
+            while IFS=$'\t' read -r u c; do
+                [[ -n "$u" ]] && user_names+=("$u") && user_counts+=("$c")
+            done <<< "$users_raw"
+        fi
+
+        if (( ${#user_names[@]} > 0 )); then
+            echo
+            echo "Found ${#user_names[@]} existing user(s) on the NAS:"
+            echo
+            local i
+            for ((i=0; i < ${#user_names[@]}; i++)); do
+                printf '    [%d] %-32s (%s folder(s))\n' \
+                    "$((i+1))" "${user_names[i]}" "${user_counts[i]}"
+            done
+            local new_choice=$(( ${#user_names[@]} + 1 ))
+            printf '    [%d] Create new user\n' "$new_choice"
+            echo
+            local choice
+            while true; do
+                choice="$(prompt "Choice" "1")"
+                if [[ "$choice" =~ ^[0-9]+$ ]] \
+                   && (( choice >= 1 )) && (( choice <= new_choice )); then
+                    break
+                fi
+                warn "  Pick a number between 1 and ${new_choice}."
+            done
+            if (( choice == new_choice )); then
+                echo
+                echo "Pick a name for your new subfolder on the NAS."
+                echo "Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars."
+                USERNAME="$(prompt_new_username)"
+            else
+                USERNAME="${user_names[$((choice - 1))]}"
+                JOINED_EXISTING_USER=1
+                info "Joining existing user: ${USERNAME}"
+            fi
+        else
+            echo
+            cat <<EOF
+No existing users found under ${NAS_BASE_DIR} on the NAS.
+Pick a name for your new subfolder.
+Letters, numbers, hyphens and underscores only. No spaces. Max 32 chars.
+EOF
+            USERNAME="$(prompt_new_username)"
+        fi
+        success "Username set: ${USERNAME}"
+    fi
+
     success "NAS base set: $(nas_user_root)"
 }
 
@@ -1689,6 +1917,13 @@ step_sync_scope() {
 # to add to .stignore for the ROMs folder on this device only.
 ROMS_INCLUDED=()
 ROMS_EXCLUDED=()
+# Per-game selections for partially-synced consoles. Each entry: "console|game".
+# A console appearing here syncs ONLY the listed games; the rest go to
+# .stignore. Built by roms_game_picker.
+ROMS_GAME_SELECTED=()
+# Directory holding console subdirs, set by step_roms_picker so roms_game_picker
+# can rescan individual consoles.
+ROMS_DIR=""
 
 is_large_rom_console() {
     local target="$1" entry id
@@ -1717,14 +1952,13 @@ step_roms_picker() {
         return 0
     fi
 
-    local roms_dir
     if [[ "$FRONTEND" == "custom" ]]; then
-        roms_dir="$CUSTOM_ROMS_PATH"
+        ROMS_DIR="$CUSTOM_ROMS_PATH"
     else
-        roms_dir="${FRONTEND_BASE}/${RD_ROMS_SUB}"
+        ROMS_DIR="${FRONTEND_BASE}/${RD_ROMS_SUB}"
     fi
-    if [[ ! -d "$roms_dir" ]]; then
-        warn "ROMs directory not found: $roms_dir"
+    if [[ ! -d "$ROMS_DIR" ]]; then
+        warn "ROMs directory not found: $ROMS_DIR"
         warn "Skipping per-console picker. All console subdirs will sync once they exist."
         return 0
     fi
@@ -1733,10 +1967,10 @@ step_roms_picker() {
     local consoles=()
     while IFS= read -r d; do
         consoles+=("$(basename "$d")")
-    done < <(find "$roms_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+    done < <(find "$ROMS_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
 
     if (( ${#consoles[@]} == 0 )); then
-        info "No console subdirectories yet in $roms_dir — all will sync as they appear."
+        info "No console subdirectories yet in $ROMS_DIR — all will sync as they appear."
         return 0
     fi
 
@@ -1746,32 +1980,76 @@ step_roms_picker() {
     if prompt_yn "Sync ALL consoles to NAS?" "y"; then
         ROMS_INCLUDED=("${consoles[@]}")
         success "Syncing all ${#consoles[@]} consoles."
-        return 0
+    else
+        echo
+        echo "Pick which consoles to sync. Excluded ones go to .stignore on THIS"
+        echo "device only — your NAS still gets them from your other devices."
+        echo "Some systems show a [!] size warning, but the default is still 'y' so"
+        echo "you don't accidentally skip them by pressing Enter."
+        echo
+        local c warn_text
+        for c in "${consoles[@]}"; do
+            if is_large_rom_console "$c"; then
+                warn_text="  $(printf '%s⚠ %s%s' "$C_YELLOW" "$(large_rom_message "$c")" "$C_RESET")"
+            else
+                warn_text=""
+            fi
+            if prompt_yn "    ${c}${warn_text}" "y"; then
+                ROMS_INCLUDED+=("$c")
+            else
+                ROMS_EXCLUDED+=("$c")
+            fi
+        done
+
+        if (( ${#ROMS_EXCLUDED[@]} > 0 )); then
+            info "Excluded on this device: ${ROMS_EXCLUDED[*]}"
+        fi
     fi
 
-    echo
-    echo "Pick which consoles to sync. Excluded ones go to .stignore on THIS"
-    echo "device only — your NAS still gets them from your other devices."
-    echo "Some systems show a [!] size warning, but the default is still 'y' so"
-    echo "you don't accidentally skip them by pressing Enter."
-    echo
-    local c warn_text
-    for c in "${consoles[@]}"; do
-        if is_large_rom_console "$c"; then
-            warn_text="  $(printf '%s⚠ %s%s' "$C_YELLOW" "$(large_rom_message "$c")" "$C_RESET")"
-        else
-            warn_text=""
+    # Offer per-game selection for any large console we're going to sync.
+    roms_game_picker
+}
+
+# For each large included console, offer "sync all games" or "pick specific
+# games." Picking specific games records them in ROMS_GAME_SELECTED; the rest
+# of that console's contents go to .stignore. Small consoles are never
+# prompted (not worth the friction — they're tiny).
+roms_game_picker() {
+    local c entries=() games=() g
+    for c in "${ROMS_INCLUDED[@]:-}"; do
+        [[ -z "$c" ]] && continue
+        is_large_rom_console "$c" || continue
+
+        # Scan one level under the console dir: each entry (file OR dir) is a
+        # candidate "game". PS3/RPCS3 rips are dirs; most others are files.
+        games=()
+        while IFS= read -r g; do
+            games+=("$(basename "$g")")
+        done < <(find "${ROMS_DIR}/${c}" -maxdepth 1 -mindepth 1 2>/dev/null | sort)
+
+        (( ${#games[@]} == 0 )) && continue   # nothing in there yet
+
+        echo
+        echo "Console '${c}' has ${#games[@]} item(s)  ($(large_rom_message "$c"))."
+        if prompt_yn "Sync ALL ${c} games?" "y"; then
+            continue   # whole console synced; no .stignore entries needed
         fi
-        if prompt_yn "    ${c}${warn_text}" "y"; then
-            ROMS_INCLUDED+=("$c")
-        else
+
+        # Let the user check off exactly which games to sync.
+        tui_multiselect "Select ${c} games to sync (the rest stay on the NAS only):" "${games[@]}"
+
+        if (( ${#TUI_SELECTED[@]} == 0 )); then
+            # Nothing chosen → exclude the whole console on this device.
             ROMS_EXCLUDED+=("$c")
+            warn "No ${c} games selected — excluding the whole console on this device."
+            continue
         fi
-    done
 
-    if (( ${#ROMS_EXCLUDED[@]} > 0 )); then
-        info "Excluded on this device: ${ROMS_EXCLUDED[*]}"
-    fi
+        for g in "${TUI_SELECTED[@]}"; do
+            ROMS_GAME_SELECTED+=("${c}|${g}")
+        done
+        success "Syncing ${#TUI_SELECTED[@]} of ${#games[@]} ${c} games."
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1953,6 +2231,7 @@ step_saves_picker() {
 
 # DEFAULT_DIRECTION is one of: sendreceive, sendonly, receiveonly
 DEFAULT_DIRECTION="sendreceive"
+MODE_DEFAULT="sendreceive"  # used as the default in choose_direction_for prompts
 PER_FOLDER_DIRECTION=()  # entries: "folder_key|direction"
 IGNORE_PERMS=1  # set by step_ignore_perms; folded into folder JSON
 
@@ -2025,19 +2304,43 @@ EOF
     fi
 }
 
-step_sync_direction() {
-    local mode_default="sendreceive"
-
+# Decide DEFAULT_DIRECTION + MODE_DEFAULT based on context: are we joining an
+# existing user, creating a new user, or doing a single-user setup? This runs
+# right after step_nas_layout so the user resolves the role question early
+# (before the scope/saves pickers) and the picker has the right defaults.
+step_setup_role() {
+    # Re-runs skip this entirely - the saved profile already has every folder's
+    # direction. step_sync_direction will offer to change them at the end.
     if [[ -n "${EXISTING_PROFILE:-}" ]]; then
-        # Re-run on a saved profile: the first-vs-adding distinction was
-        # answered last time. Re-asking it would be confusing (e.g. a user
-        # who picked "Adding" originally would have to lie and pick
-        # "First device" just to flip to two-way). Skip straight to the
-        # direction picker.
-        DEFAULT_DIRECTION="$(choose_direction_for "all folders (default)" "sendreceive")"
-    else
+        return 0
+    fi
+
+    # Multi-user, joined existing user via the picker → adding by definition.
+    if [[ $JOINED_EXISTING_USER -eq 1 ]]; then
+        DEFAULT_DIRECTION="receiveonly"
+        MODE_DEFAULT="receiveonly"
         echo
-        cat <<EOF
+        info "Joining an existing user automatically sets sync direction to Receive only —"
+        info "this device pulls the existing NAS data down first. After the first full sync"
+        info "completes, re-run the script and pick a Two-way direction at the prompt."
+        return 0
+    fi
+
+    # Multi-user, creating a new user → no prior devices for this user, so
+    # treat as first device.
+    if [[ $MULTI_USER -eq 1 ]]; then
+        DEFAULT_DIRECTION="sendreceive"
+        MODE_DEFAULT="sendreceive"
+        echo
+        info "New user '${USERNAME}' on the NAS — this is the first device for that user."
+        info "Sync direction defaults to Two-way (push and pull)."
+        return 0
+    fi
+
+    # Single-user: ask. If the NAS already has single-user folders configured,
+    # default to "Adding" since that's almost certainly the right answer.
+    echo
+    cat <<EOF
 Is this your first device, or are you adding this device to an
 existing NAS-based RetroSync setup?
 
@@ -2048,29 +2351,41 @@ existing NAS-based RetroSync setup?
     [2] Adding to an existing setup — the NAS already has data from
         another device. Pull NAS data DOWN first; do NOT push this
         device's existing files up. Default direction: Receive only.
-        After the first full sync completes, you'll need to flip
-        folders to Two-way so future edits go both ways. Two ways
-        to do that:
-          - In the Syncthing web UI: open each folder -> Edit ->
-            Folder Type -> 'Send & Receive' -> Save.
-          - Or re-run this script (it skips this question on
-            re-runs and goes straight to the direction picker).
+        After the first full sync completes, re-run this script and
+        pick a Two-way direction at the prompt to enable two-way.
 EOF
-        local mode_choice
-        mode_choice="$(prompt "Choice" "1")"
+    local default_choice="1"
+    if nas_has_single_user_folders; then
+        echo
+        info "  (The NAS already has single-user folders configured. If those were"
+        info "   set up by another device, [2] Adding is probably right.)"
+        default_choice="2"
+    fi
+    local mode_choice
+    mode_choice="$(prompt "Choice" "$default_choice")"
+    if [[ "$mode_choice" == "2" ]]; then
+        DEFAULT_DIRECTION="receiveonly"
+        MODE_DEFAULT="receiveonly"
+        echo
+        info "Sync direction set to Receive only."
+    else
+        DEFAULT_DIRECTION="sendreceive"
+        MODE_DEFAULT="sendreceive"
+    fi
+}
 
-        if [[ "$mode_choice" == "2" ]]; then
-            # "Adding to existing setup" already implies receive-only — asking
-            # for a direction next would just contradict the choice the user
-            # already made. Lock it in and move on.
-            DEFAULT_DIRECTION="receiveonly"
-            mode_default="receiveonly"
-            echo
-            info "Sync direction set to Receive only (matches 'Adding' choice)."
-        else
-            mode_default="sendreceive"
-            DEFAULT_DIRECTION="$(choose_direction_for "all folders (default)" "$mode_default")"
-        fi
+step_sync_direction() {
+    # The first-device-vs-adding question was answered by step_setup_role
+    # (or inferred from EXISTING_PROFILE on re-run). This step just confirms
+    # the resolved DEFAULT_DIRECTION and optionally lets the user override
+    # per-folder.
+
+    if [[ -n "${EXISTING_PROFILE:-}" ]]; then
+        # Re-run: re-pick the default direction. The per-folder direction is
+        # already saved per folder in the profile; we only need a fresh
+        # DEFAULT_DIRECTION for any newly-added folders.
+        DEFAULT_DIRECTION="$(choose_direction_for "all folders (default)" "sendreceive")"
+        MODE_DEFAULT="$DEFAULT_DIRECTION"
     fi
 
     if prompt_yn "Apply this direction to ALL folders?" "y"; then
@@ -2079,7 +2394,7 @@ EOF
             info "Reminder: after the first full sync finishes (watch progress at"
             info "  ${SYNCTHING_LOCAL_DEFAULT}), flip folders to Two-way. Either:"
             info "    - Web UI: each folder -> Edit -> Folder Type -> 'Send & Receive'."
-            info "    - Or re-run this script: pick [1] Update at the profile"
+            info "    - Or re-run this script: pick [2] Update at the profile"
             info "      prompt, then pick [1] Two-way at the direction prompt."
         fi
         return 0
@@ -2091,7 +2406,7 @@ EOF
         IFS='|' read -r key label _ _ <<< "$entry"
         printf '%s\n' "${SELECTED_SCOPES[@]}" | grep -qx "$key" || continue
         local d
-        d="$(choose_direction_for "$label" "$mode_default")"
+        d="$(choose_direction_for "$label" "$MODE_DEFAULT")"
         PER_FOLDER_DIRECTION+=("${key}|${d}")
     done
 
@@ -2099,7 +2414,7 @@ EOF
     for sentry in "${SELECTED_SAVES[@]}"; do
         IFS='|' read -r slabel sconsole spath snas_sub <<< "$sentry"
         local d
-        d="$(choose_direction_for "${slabel}" "$mode_default")"
+        d="$(choose_direction_for "${slabel}" "$MODE_DEFAULT")"
         PER_FOLDER_DIRECTION+=("save-${sconsole}|${d}")
     done
 }
@@ -2460,6 +2775,12 @@ apply_folder() {
 }
 
 # Write .stignore patterns for a folder on local Syncthing.
+# Per-folder raw .stignore lines, keyed by Syncthing folder id. Populated by
+# step_apply_all for folders that need ignore rules (roms per-console/per-game,
+# rd-media per-console). Values are newline-joined, already-formed lines like
+# "!/ps3/God of War" or "/snes" — written verbatim, no decoration.
+declare -A FOLDER_IGNORE_LINES=()
+
 apply_ignores() {
     local id="$1"
     shift
@@ -2484,6 +2805,70 @@ apply_ignores() {
     fi
     st_post local "/db/ignores?folder=${id}" "$json" >/dev/null \
         || warn "Failed to write .stignore for $id"
+}
+
+# Write already-formed .stignore lines verbatim (used for the roms folder where
+# patterns include "!" negations and "**" globs whose ordering matters).
+apply_ignore_lines() {
+    local id="$1"
+    shift
+    local lines=("$@")
+    (( ${#lines[@]} == 0 )) && return 0
+    local body l
+    body="$(printf '// Auto-generated by %s — do not edit manually\n// To update, re-run %s' \
+        "$RETROSYNC_NAME" "$(basename "$0")")"
+    for l in "${lines[@]}"; do
+        body+=$'\n'"$l"
+    done
+    local json
+    json="$(jq -n --arg ignore "$body" '{ignore: ($ignore | split("\n"))}')"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        dry "Would write .stignore for $id (${#lines[@]} line(s)):"
+        for l in "${lines[@]}"; do dry "    $l"; done
+        return 0
+    fi
+    st_post local "/db/ignores?folder=${id}" "$json" >/dev/null \
+        || warn "Failed to write .stignore for $id"
+}
+
+# Produce the ordered .stignore lines for the roms folder from ROMS_EXCLUDED
+# (whole-console exclusions) and ROMS_GAME_SELECTED (per-game inclusions).
+# Include ("!") lines MUST come before the matching ignore lines — Syncthing
+# matches top-down, first match wins — so we emit all includes first.
+#
+# For a partially-synced console: keep only the chosen games, ignore the rest
+# of that console's contents (but NOT the console dir itself, or the kept games
+# would have nowhere to live). For a fully-excluded console: ignore the dir.
+build_roms_ignore_lines() {
+    local -a includes=() excludes=()
+    local -A partial=()
+    local entry c g
+
+    for entry in "${ROMS_GAME_SELECTED[@]:-}"; do
+        [[ -z "$entry" ]] && continue
+        c="${entry%%|*}"
+        g="${entry#*|}"
+        partial["$c"]=1
+        # Two lines per game: the entry itself, and (for folder-style games)
+        # everything beneath it.
+        includes+=("!/${c}/${g}")
+        includes+=("!/${c}/${g}/**")
+    done
+
+    # Ignore the non-selected remainder of each partial console's contents.
+    for c in "${!partial[@]}"; do
+        excludes+=("/${c}/**")
+    done
+
+    # Fully-excluded consoles: ignore the whole directory.
+    for c in "${ROMS_EXCLUDED[@]:-}"; do
+        [[ -z "$c" ]] && continue
+        excludes+=("/${c}")
+    done
+
+    local l
+    for l in "${includes[@]:-}"; do [[ -n "$l" ]] && printf '%s\n' "$l"; done
+    for l in "${excludes[@]:-}"; do [[ -n "$l" ]] && printf '%s\n' "$l"; done
 }
 
 # Mirror the folder onto NAS at the given NAS path, then on local at the given
@@ -2514,8 +2899,15 @@ provision_folder() {
         return 1
     fi
 
-    # Write ignores (local side only).
-    if [[ -n "$ignore_patterns_csv" ]]; then
+    # Write ignores (local side only). Prefer the raw-lines channel
+    # (FOLDER_IGNORE_LINES) which supports "!" includes and ordering; fall
+    # back to the legacy comma-separated bare-name channel if that's all
+    # we were given.
+    if [[ -n "${FOLDER_IGNORE_LINES[$id]:-}" ]]; then
+        local _lines=() _l
+        while IFS= read -r _l; do _lines+=("$_l"); done <<< "${FOLDER_IGNORE_LINES[$id]}"
+        apply_ignore_lines "$id" "${_lines[@]}"
+    elif [[ -n "$ignore_patterns_csv" ]]; then
         IFS=',' read -ra _pats <<< "$ignore_patterns_csv"
         apply_ignores "$id" "${_pats[@]}"
     fi
@@ -2561,14 +2953,20 @@ step_apply_all() {
         # so the prefixed keys (rd-states, rb-retroarch-states) still work.
         [[ "$key" == *"states"* ]] && versioning="true"
 
-        local ignores=""
-        if [[ "$key" == "roms" ]] && (( ${#ROMS_EXCLUDED[@]} > 0 )); then
-            ignores="$(IFS=','; echo "${ROMS_EXCLUDED[*]}")"
+        # Build the .stignore lines for this folder (raw-lines channel).
+        local fid
+        fid="$(folder_id_for "$key")"
+        if [[ "$key" == "roms" ]]; then
+            local _roms_lines
+            _roms_lines="$(build_roms_ignore_lines)"
+            [[ -n "$_roms_lines" ]] && FOLDER_IGNORE_LINES["$fid"]="$_roms_lines"
         elif [[ "$key" == "rd-media" ]] && (( ${#MEDIA_EXCLUDED[@]} > 0 )); then
-            ignores="$(IFS=','; echo "${MEDIA_EXCLUDED[*]}")"
+            local _ml="" mc
+            for mc in "${MEDIA_EXCLUDED[@]}"; do _ml+="/${mc}"$'\n'; done
+            FOLDER_IGNORE_LINES["$fid"]="${_ml%$'\n'}"
         fi
 
-        provision_folder "$key" "$label" "$lp" "$np" "$versioning" "$ignores" || true
+        provision_folder "$key" "$label" "$lp" "$np" "$versioning" "" || true
     done
 
     # Per-emulator saves.
@@ -2629,6 +3027,21 @@ print_summary() {
         printf '    %s\n' "${ROMS_EXCLUDED[*]}"
     fi
 
+    if (( ${#ROMS_GAME_SELECTED[@]:-0} > 0 )); then
+        echo
+        echo "  Consoles syncing only selected games on this device:"
+        # Tally per-console counts from ROMS_GAME_SELECTED ("console|game").
+        local -A _gc=()
+        local _e _c
+        for _e in "${ROMS_GAME_SELECTED[@]}"; do
+            _c="${_e%%|*}"
+            _gc["$_c"]=$(( ${_gc["$_c"]:-0} + 1 ))
+        done
+        for _c in "${!_gc[@]}"; do
+            printf '    %-12s %s game(s)\n' "$_c" "${_gc[$_c]}"
+        done
+    fi
+
     echo
     echo "  Syncthing is now syncing in the background."
     echo "  Monitor at: ${SYNCTHING_LOCAL_DEFAULT}"
@@ -2650,7 +3063,12 @@ build_profile_json() {
     for entry in "${APPLIED_FOLDERS[@]:-}"; do
         IFS='|' read -r id label lp np dir ver ignores <<< "$entry"
         local ign_arr
-        if [[ -n "$ignores" ]]; then
+        # Prefer the raw-lines channel (what was actually written to .stignore);
+        # fall back to the legacy CSV field for older code paths.
+        if [[ -n "${FOLDER_IGNORE_LINES[$id]:-}" ]]; then
+            ign_arr="$(printf '%s' "${FOLDER_IGNORE_LINES[$id]}" \
+                | jq -R -s 'split("\n") | map(select(length > 0))')"
+        elif [[ -n "$ignores" ]]; then
             ign_arr="$(echo "$ignores" | jq -R 'split(",")')"
         else
             ign_arr="[]"
@@ -3013,6 +3431,7 @@ main() {
     step_frontend_selection
     step_nas_connection
     step_nas_layout
+    step_setup_role
     step_sync_scope
     step_roms_picker
     step_media_picker
