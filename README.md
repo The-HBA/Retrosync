@@ -71,10 +71,9 @@ Choose "pick" and you get a terminal checkbox:
 Select ps3 games to sync (the rest stay on the NAS only):
   ↑/↓ move · SPACE toggle · a=all · n=none · ENTER confirm
 
-  > [x] Demon's Souls
-    [ ] God of War III
-    [x] Persona 5
-    [ ] Gran Turismo 6
+  > [x] Minecraft
+    [ ] Toy Story 3
+    [x] Gran Turismo 6
     ...
   2 of 47 selected
 ```
