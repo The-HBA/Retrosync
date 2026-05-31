@@ -1,14 +1,14 @@
 # Retrosync
 Retrosync is a script that automates the process of creating syncthing connections to sync/backup your roms, bios, saves, states, ES-DE gamelists and media.
 
-> **Note:** To be fully transperent, this project is made using artificial intelligence, I welcome any help or even taking over the project. Currently the project depends on the user already having syncthing running in the background. It auto-detects RetroDECK and RetroBat layouts, and a custom-locations mode handles any other frontend or folder layout. In the future it could be a full on app and container stack.
+> **Note:** To be fully transperent, this project is made using artificial intelligence, I welcome any help or even taking over the project. Currently the project depends on the user already having syncthing running in the background. It auto-detects EmuDeck, RetroDECK and RetroBat layouts, and a custom-locations mode handles any other frontend or folder layout. In the future it could be a full on app and container stack.
 
 Configure [Syncthing](https://syncthing.net) to keep your retro gaming files —
 ROMs, BIOS, saves, save states, and ES-DE metadata — in sync between your
 client devices and a central NAS hub. One interactive setup, idempotent
 re-runs, and the GUI stays untouched.
 
-> **Status:** v0.4.0 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing. Highlights since v0.3.0: **per-game selective sync** (check off exactly which games to sync from a big console folder via a terminal checkbox — no need to mirror 80 GB of PS3 games to a Steam Deck), an **existing-user picker** for multi-user setups, a read-only **"show current configuration"** view, and a **custom locations** mode that works with any frontend or layout. Please open an issue if anything breaks. Feel free to contribute or build on the idea.
+> **Status:** v0.5.0 — Windows ↔ Windows (RetroBat) syncing is stable. Linux ↔ Linux (RetroDECK) and cross-OS sync are in testing. **New in v0.5.0: EmuDeck is a first-class frontend** — because EmuDeck uses the *same* `Emulation/` layout on Windows and Linux, its saves sync cleanly across both OSes (the cross-platform sync RetroBat↔RetroDECK can't do). Other highlights since v0.3.0: **per-game selective sync** (check off exactly which games to sync from a big console folder via a terminal checkbox), a **case-collision detector** (catches cross-OS `Databases/` vs `databases/` before it stalls sync), a **reset/cleanup tool**, an **existing-user picker** for multi-user setups, and a read-only **"show current configuration"** view. Please open an issue if anything breaks. Feel free to contribute or build on the idea.
 
 ---
 
@@ -39,21 +39,71 @@ duplicates.
 
 | Frontend | Status |
 |---|---|
+| **EmuDeck (Windows + Linux)** | ✅ Supported — ★ best for Windows↔Linux sync |
 | RetroBat (Windows)                     | ✅ Supported (Stable) |
 | RetroDECK (Linux Flatpak)              | ✅ Supported (Testing) |
 | **Custom locations (any frontend, any layout)** | ✅ Supported |
-| EmuDeck (Linux)                        | 🔜 Planned (works today via custom mode) |
-| EmuDeck (Windows)                      | 🔜 Planned (works today via custom mode) |
 | Standalone ES-DE                       | ✅ Works via custom mode |
 | Batocera, Lakka, RecalBox              | ✅ Works via custom mode |
+
+The frontend menu now leads with EmuDeck on both scripts:
+
+```
+Linux  (retrosync-setup.sh):   [1] EmuDeck   [2] RetroDECK   [3] Custom
+Windows (retrosync-setup.ps1): [1] EmuDeck   [2] RetroBat    [3] Custom
+```
 
 **Custom mode** lets you manually enter the absolute path for each thing
 you want to sync (ROMs, BIOS, save states, ES-DE gamelists, ES-DE media,
 plus per-emulator save folders). Leave a prompt blank to skip that entry.
 This makes RetroSync work with any frontend, any folder layout, or no
 frontend at all — at the cost of typing the paths yourself instead of
-having them auto-detected. Pick option `[2] Custom locations` when the
+having them auto-detected. Pick option `[3] Custom locations` when the
 script asks which frontend you're using.
+
+---
+
+## EmuDeck: the cross-platform sync path
+
+EmuDeck is the one setup where **Windows ↔ Linux save sync actually works**.
+RetroBat and RetroDECK are different projects with different folder layouts, so
+their saves can't be shared across OSes. EmuDeck, by contrast, puts everything
+under a single `Emulation/` root with the **identical relative layout on Windows
+and Linux** — which is exactly why EmuDeck's own (paid) cloud sync is
+cross-platform. RetroSync uses the same fact, for free, through your own NAS.
+
+**Auto-detection.** RetroSync reads EmuDeck's settings file to find your
+`Emulation/` folder:
+
+- Linux: `~/.config/EmuDeck/backend/settings.sh` (`emulationPath=~/Emulation`)
+- Windows: `%APPDATA%\EmuDeck\settings.ps1` (`$emulationPath="D:\Emulation"`)
+
+That value can be stale (e.g. it says `~/Emulation` while your data is really on
+an SD card), so RetroSync treats it as a starting guess, checks whether it
+exists, and always lets you confirm or correct it.
+
+**What syncs (v0.5.0):**
+
+| Scope | Folder | Notes |
+|---|---|---|
+| ROMs | `Emulation/roms/` | shared across all frontends; per-game selective sync works |
+| BIOS | `Emulation/bios/` | shared across all frontends |
+| **Saves + states** | `Emulation/saves/` (whole tree) | the cross-OS win — one folder, shared between EmuDeck-Windows ↔ EmuDeck-Linux; versioned (5 kept) |
+
+Because the `saves/` tree has the same per-emulator layout on both OSes, it
+syncs as a single `ed-saves` folder with no per-emulator path mapping.
+
+> **Caveat — `storage/` is not synced yet.** A few consoles (notably **PS3**,
+> **3DS**, and **PS Vita**) keep their real save data under `Emulation/storage/`
+> (`rpcs3/dev_hdd0/…/savedata`, `azahar/sdmc`, `Vita3K/ux0`) rather than under
+> `saves/`. `storage/` also holds huge device-specific data (installed games),
+> so v0.5.0 leaves it out. PS1/PS2/GameCube/Wii/Wii U/DS/PSP/Switch saves are
+> captured by `ed-saves`; PS3/3DS/Vita support via the save subpaths of
+> `storage/` is a planned follow-up. Use custom mode for those in the meantime.
+
+**To test cross-OS sync:** install EmuDeck on both a Windows PC and a Linux
+device (e.g. Steam Deck), run RetroSync on each with frontend `[1]` and the
+**same NAS user**, make a save on one, and watch it appear on the other.
 
 ---
 
@@ -71,9 +121,10 @@ Choose "pick" and you get a terminal checkbox:
 Select ps3 games to sync (the rest stay on the NAS only):
   ↑/↓ move · SPACE toggle · a=all · n=none · ENTER confirm
 
-  > [x] Minecraft
-    [ ] Toy Story 3
-    [x] Gran Turismo 6
+  > [x] Demon's Souls
+    [ ] God of War III
+    [x] Persona 5
+    [ ] Gran Turismo 6
     ...
   2 of 47 selected
 ```
@@ -270,13 +321,13 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
      folders, otherwise fully deletes); optionally delete local data and/or
      point you at the NAS data to delete manually
    - `[5] Exit`
-3. **Frontend selection.** Pick `[1]` for RetroDECK (Linux) or RetroBat
-   (Windows) — the script auto-detects the install path (parses
-   `retrodeck.cfg` on Linux to find custom `rdhome=` locations) and lets
-   you confirm or override. Pick `[2] Custom locations` for any other
-   layout — the script then asks for the absolute path to each thing you
-   want to sync (ROMs, BIOS, states, gamelists, media, then per-emulator
-   save folders); leave a prompt blank to skip that entry.
+3. **Frontend selection.** `[1] EmuDeck` (recommended for cross-OS — detects
+   `Emulation/` from EmuDeck's settings file), `[2]` for RetroDECK (Linux,
+   parses `retrodeck.cfg` for custom `rdhome=`) or RetroBat (Windows), or
+   `[3] Custom locations` for any other layout — which then asks for the
+   absolute path to each thing you want to sync (ROMs, BIOS, states,
+   gamelists, media, then per-emulator save folders); leave a prompt blank to
+   skip that entry. Every detected path is confirmable/overridable.
 4. **NAS connection.** Address (port defaults to 8384 if omitted), API key,
    ping check, device-ID exchange, and pairs the devices on both sides. Pins
    the NAS device's address to `tcp://<host>:22000` so future connects don't
@@ -555,10 +606,12 @@ gracefully. If you're on an older version, upgrade and re-run.
 
 ## Known limitations
 
-- Supports RetroDECK and RetroBat with auto-detection, plus a
-  custom-locations mode for any other frontend (EmuDeck, standalone ES-DE,
-  Batocera, Lakka, plain RetroArch, custom layouts). First-class support
-  for EmuDeck with auto-detection is planned.
+- Supports EmuDeck, RetroDECK and RetroBat with auto-detection, plus a
+  custom-locations mode for any other frontend (standalone ES-DE, Batocera,
+  Lakka, plain RetroArch, custom layouts).
+- EmuDeck `storage/` is not synced yet, so PS3/3DS/Vita saves (which live
+  under `storage/`, not `saves/`) aren't covered by the `ed-saves` scope.
+  Use custom mode for those until the `storage/` follow-up lands.
 - In custom mode, re-running the script does not re-prompt for paths or
   let you add new emulator save folders interactively — it re-applies the
   paths from the saved profile. To add a new path, either edit
