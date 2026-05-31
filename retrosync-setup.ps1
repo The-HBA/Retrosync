@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 # -----------------------------------------------------------------------------
 # 1. Banner & version
 # -----------------------------------------------------------------------------
-$Script:RetroSyncVersion = '0.4.2'
+$Script:RetroSyncVersion = '0.5.0'
 $Script:RetroSyncName    = 'RetroSync'
 $Script:FolderIdPrefix   = 'retrosync'
 
@@ -116,6 +116,24 @@ $Script:RB_GAMELISTS_SUB      = 'emulationstation\.emulationstation'
 # RetroBat has no separate downloaded_media root by default - ES-DE media lives
 # inside the .emulationstation folder. We sync the whole ES folder for both.
 $Script:RB_MEDIA_SUB          = 'emulationstation\.emulationstation'
+
+# -----------------------------------------------------------------------------
+# 4b. Frontend definitions - EmuDeck (Windows + Linux, identical layout)
+# -----------------------------------------------------------------------------
+# EmuDeck standardizes everything under one Emulation\ root with the SAME
+# relative layout on Windows and Linux, which is why EmuDeck<->EmuDeck saves
+# sync cross-OS. roms/bios are bare/shared; the whole saves\ tree syncs as one
+# folder (ed-saves) shared between EmuDeck-Win and EmuDeck-Linux.
+#
+# EmuDeck records its paths in %APPDATA%\EmuDeck\settings.ps1, e.g.
+#   $emulationPath="D:\Emulation"
+# The value can be stale, so we parse it as a starting guess, verify it exists,
+# and always let the user confirm or override.
+$Script:EmudeckSettingsFile = [System.IO.Path]::Combine($env:APPDATA, 'EmuDeck', 'settings.ps1')
+$Script:EmudeckDefaultRoot  = 'C:\Emulation'
+$Script:ED_ROMS_SUB  = 'roms'
+$Script:ED_BIOS_SUB  = 'bios'
+$Script:ED_SAVES_SUB = 'saves'
 
 # Per-emulator save subpaths relative to the install root.
 # Format: PSCustomObject { Label; ConsoleId; SubPath; Notes }
@@ -785,24 +803,65 @@ function Step-FrontendSelection {
     Write-Host ""
     Write-Host "Which retro gaming frontend are you using on this device?"
     Write-Host ""
-    Write-Host "    [1] RetroBat (Windows)"
-    Write-Host "    [2] Custom locations  (manually enter the path for each thing to sync)"
+    Write-Host "    [1] EmuDeck (Windows)  * recommended for Windows<->Linux sync"
+    Write-Host "    [2] RetroBat (Windows)"
+    Write-Host "    [3] Custom locations  (manually enter the path for each thing to sync)"
     Write-Host ""
-    Write-Host "  Pick [2] if you run any non-RetroBat frontend on Windows (EmuDeck,"
-    Write-Host "  standalone ES-DE, LaunchBox, plain RetroArch, custom layouts) or"
-    Write-Host "  if your save folders live somewhere other than the default"
-    Write-Host "  RetroBat layout. RetroDECK users should use retrosync-setup.sh"
-    Write-Host "  on Linux."
+    Write-Host "  EmuDeck uses the SAME layout on Windows and Linux, so its saves sync"
+    Write-Host "  cleanly across both - pick [1] if you run EmuDeck here and also on a"
+    Write-Host "  Steam Deck / Linux box. Pick [3] for any other frontend (standalone"
+    Write-Host "  ES-DE, LaunchBox, plain RetroArch, custom layouts). RetroDECK users"
+    Write-Host "  should use retrosync-setup.sh on Linux."
     Write-Host ""
     $choice = Read-Prompt "Choice" "1"
     switch ($choice) {
-        '1' { $Script:Frontend = 'retrobat'; Find-RetrobatBase }
-        '2' { $Script:Frontend = 'custom';   Read-CustomPaths }
+        '1' { $Script:Frontend = 'emudeck';  Find-EmudeckBase }
+        '2' { $Script:Frontend = 'retrobat'; Find-RetrobatBase }
+        '3' { $Script:Frontend = 'custom';   Read-CustomPaths }
         default {
             Write-Err "Invalid choice: $choice."
             exit 1
         }
     }
+}
+
+# Detect the Emulation\ root for EmuDeck: parse emulationPath from
+# %APPDATA%\EmuDeck\settings.ps1, verify it exists (the value can be stale),
+# then confirm/override with the user.
+function Find-EmudeckBase {
+    $detected = ''
+    if (Test-Path -LiteralPath $Script:EmudeckSettingsFile) {
+        $line = Select-String -LiteralPath $Script:EmudeckSettingsFile -Pattern '^\$emulationPath\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($line -and $line.Line -match '=\s*"?([^"]+)"?\s*$') {
+            $detected = $matches[1].TrimEnd('\','/')
+            Write-Verb "Parsed EmuDeck settings.ps1 emulationPath -> $detected"
+        }
+    } else {
+        Write-Warn "EmuDeck settings not found at $Script:EmudeckSettingsFile"
+        Write-Warn "Is EmuDeck installed and has it been run at least once?"
+    }
+
+    if (-not $detected -or -not (Test-Path -LiteralPath $detected)) {
+        if ($detected -and -not (Test-Path -LiteralPath $detected)) {
+            Write-Warn "EmuDeck settings point to '$detected', but it doesn't exist on disk."
+            Write-Warn "If your Emulation\ folder is on another drive, enter its real path."
+        }
+        if (Test-Path -LiteralPath $Script:EmudeckDefaultRoot) { $detected = $Script:EmudeckDefaultRoot }
+        if (-not $detected) { $detected = $Script:EmudeckDefaultRoot }
+    }
+
+    Write-Host ""
+    $Script:FrontendBase = Read-Prompt "EmuDeck Emulation directory" $detected
+    $Script:FrontendBase = $Script:FrontendBase.TrimEnd('\','/')
+
+    if (-not (Test-Path -LiteralPath $Script:FrontendBase)) {
+        Write-Warn "Path does not exist yet: $Script:FrontendBase"
+        if (-not (Read-PromptYn "Continue anyway? (Syncthing will create it on first sync)" 'y')) {
+            Write-Err "Cancelled."
+            exit 1
+        }
+    }
+    Write-Success "Using EmuDeck base: $Script:FrontendBase"
 }
 
 function Find-RetrobatBase {
@@ -1483,6 +1542,21 @@ function Initialize-SyncScopeDefinitions {
         return
     }
 
+    if ($Script:Frontend -eq 'emudeck') {
+        # EmuDeck uses the identical Emulation\ layout on Windows and Linux, so
+        # the whole saves\ tree syncs cross-OS as ONE folder. The "ed-saves"
+        # key matches the Bash script's key, so an EmuDeck Windows PC and an
+        # EmuDeck Steam Deck share the same Syncthing folder and their saves
+        # sync straight across. roms/bios stay bare. storage\ (installed games,
+        # scraped media) is left out for now - use custom mode for parts of it.
+        $Script:SyncScopeDefinitions = @(
+            [PSCustomObject]@{Key='roms';     Label='ROMs';                                          LocalSub=$Script:ED_ROMS_SUB;  NasSub='roms'},
+            [PSCustomObject]@{Key='bios';     Label='BIOS';                                          LocalSub=$Script:ED_BIOS_SUB;  NasSub='bios'},
+            [PSCustomObject]@{Key='ed-saves'; Label='Saves + states (EmuDeck - all emulators, cross-OS)'; LocalSub=$Script:ED_SAVES_SUB; NasSub='saves/emudeck'}
+        )
+        return
+    }
+
     $Script:SyncScopeDefinitions = @(
         [PSCustomObject]@{Key='roms';                Label='ROMs';                                  LocalSub=$Script:RB_ROMS_SUB;      NasSub='roms'},
         [PSCustomObject]@{Key='bios';                Label='BIOS';                                  LocalSub=$Script:RB_BIOS_SUB;      NasSub='bios'},
@@ -1522,8 +1596,13 @@ function Step-SyncScope {
             $Script:SelectedScopes += $entry.Key
         }
     }
-    if (Read-PromptYn "  Saves (per-emulator)" 'y') {
-        $Script:SavesSelected = $true
+    # The per-emulator saves picker only applies to RetroBat (its saves live in
+    # many per-emulator folders). EmuDeck syncs its whole saves\ tree via the
+    # ed-saves scope above, so it never needs this question.
+    if ($Script:Frontend -eq 'retrobat') {
+        if (Read-PromptYn "  Saves (per-emulator)" 'y') {
+            $Script:SavesSelected = $true
+        }
     }
 }
 
@@ -2436,8 +2515,10 @@ function Step-ApplyAll {
         $nasPath   = "$nasUserRoot/$($entry.NasSub)"
         $versioning = $false
         # Save states get versioning - they're easy to corrupt and the user
-        # benefits from being able to roll back.
+        # benefits from being able to roll back. EmuDeck's ed-saves bundles
+        # saves AND states, so version it too.
         if ($entry.Key -like '*states*') { $versioning = $true }
+        if ($entry.Key -eq 'ed-saves')   { $versioning = $true }
         $rawLines = @()
         if ($entry.Key -eq 'roms') {
             $rawLines = @(Get-RomsIgnoreLines)

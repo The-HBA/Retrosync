@@ -24,7 +24,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Banner & version
 # ─────────────────────────────────────────────────────────────────────────────
-readonly RETROSYNC_VERSION="0.4.2"
+readonly RETROSYNC_VERSION="0.5.0"
 readonly RETROSYNC_NAME="RetroSync"
 readonly FOLDER_ID_PREFIX="retrosync"
 
@@ -115,6 +115,28 @@ readonly RD_SAVES_SUB="saves"
 readonly RD_STATES_SUB="states"
 readonly RD_GAMELISTS_SUB="ES-DE/gamelists"
 readonly RD_MEDIA_SUB="ES-DE/downloaded_media"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. Frontend definitions — EmuDeck (Linux + Windows, identical layout)
+# ─────────────────────────────────────────────────────────────────────────────
+# EmuDeck standardizes everything under one Emulation/ root with the SAME
+# relative layout on Linux and Windows, which is why EmuDeck<->EmuDeck saves
+# sync cross-OS (EmuDeck's own paid Cloud sync relies on this). RetroSync uses
+# the same fact: roms/bios are bare/shared, and the whole saves/ tree syncs as
+# one folder (ed-saves) shared between EmuDeck-Win and EmuDeck-Linux.
+#
+# EmuDeck records its paths in a settings file:
+#   Linux:   ~/.config/EmuDeck/backend/settings.sh   (emulationPath=~/Emulation)
+#   Windows: %APPDATA%\EmuDeck\settings.ps1          ($emulationPath="D:\Emulation")
+# The value can be stale (e.g. says ~/Emulation while the data is really on an
+# SD card), so we parse it as a starting guess, verify it exists, and always
+# let the user confirm or override.
+readonly EMUDECK_SETTINGS_FILE="$HOME/.config/EmuDeck/backend/settings.sh"
+readonly EMUDECK_DEFAULT_BASE="$HOME/Emulation"
+# Subpaths relative to the Emulation/ root (same on both OSes).
+readonly ED_ROMS_SUB="roms"
+readonly ED_BIOS_SUB="bios"
+readonly ED_SAVES_SUB="saves"
 
 # Per-emulator save subpaths.
 #
@@ -1093,21 +1115,74 @@ step_frontend_selection() {
     echo
     echo "Which retro gaming frontend are you using on this device?"
     echo
-    echo "    [1] RetroDECK (Linux Flatpak)"
-    echo "    [2] Custom locations  (manually enter the path for each thing to sync)"
+    echo "    [1] EmuDeck (Linux)   ★ recommended for Windows<->Linux sync"
+    echo "    [2] RetroDECK (Linux Flatpak)"
+    echo "    [3] Custom locations  (manually enter the path for each thing to sync)"
     echo
-    echo "  Pick [2] if you run any non-RetroDECK frontend on Linux (EmuDeck,"
-    echo "  standalone ES-DE, Lutris, plain RetroArch, custom layouts) or if"
-    echo "  your save folders live somewhere other than the default RetroDECK"
-    echo "  layout. RetroBat users should use retrosync-setup.ps1 on Windows."
+    echo "  EmuDeck uses the SAME layout on Linux and Windows, so its saves sync"
+    echo "  cleanly across both — pick [1] if you run EmuDeck on this device and"
+    echo "  also on a Windows PC. Pick [3] for any other frontend (standalone"
+    echo "  ES-DE, Lutris, plain RetroArch, custom layouts). RetroBat users"
+    echo "  should use retrosync-setup.ps1 on Windows."
     echo
     local choice
     choice="$(prompt "Choice" "1")"
     case "$choice" in
-        1) FRONTEND="retrodeck"; detect_retrodeck_base ;;
-        2) FRONTEND="custom";    collect_custom_paths   ;;
+        1) FRONTEND="emudeck";   detect_emudeck_base    ;;
+        2) FRONTEND="retrodeck"; detect_retrodeck_base  ;;
+        3) FRONTEND="custom";    collect_custom_paths   ;;
         *) fatal "Invalid choice: $choice." ;;
     esac
+}
+
+# Detect the Emulation/ root for EmuDeck by:
+# 1. Parsing emulationPath from ~/.config/EmuDeck/backend/settings.sh
+# 2. Expanding ~ and verifying the path exists (the setting can be stale)
+# 3. Falling back to ~/Emulation, then asking the user to confirm or override
+detect_emudeck_base() {
+    local detected=""
+    if [[ -f "$EMUDECK_SETTINGS_FILE" ]]; then
+        # settings.sh lines look like: emulationPath=~/Emulation
+        local raw
+        raw="$(grep -E '^emulationPath=' "$EMUDECK_SETTINGS_FILE" 2>/dev/null \
+            | head -n1 | cut -d= -f2- || true)"
+        # Strip optional surrounding quotes, then expand a leading ~.
+        raw="${raw%\"}"; raw="${raw#\"}"
+        raw="${raw%\'}"; raw="${raw#\'}"
+        if [[ "$raw" == "~"* ]]; then raw="${HOME}${raw#\~}"; fi
+        if [[ -n "$raw" ]]; then
+            detected="${raw%/}"
+            verbose "Parsed EmuDeck settings.sh emulationPath -> ${detected}"
+        fi
+    else
+        warn "EmuDeck settings not found at ${EMUDECK_SETTINGS_FILE}"
+        warn "Is EmuDeck installed and has it been run at least once?"
+    fi
+
+    # If the parsed path doesn't exist (common when EmuDeck is on an SD card
+    # but settings.sh still says ~/Emulation), fall back to a sensible default
+    # so the prompt has a starting value — the user will correct it.
+    if [[ -z "$detected" ]] || [[ ! -d "$detected" ]]; then
+        if [[ -n "$detected" ]] && [[ ! -d "$detected" ]]; then
+            warn "EmuDeck settings point to '${detected}', but it doesn't exist on disk."
+            warn "If your Emulation/ folder is on an SD card, enter its real path"
+            warn "(e.g. /run/media/deck/<id>/Emulation)."
+        fi
+        [[ -d "$EMUDECK_DEFAULT_BASE" ]] && detected="$EMUDECK_DEFAULT_BASE"
+        [[ -z "$detected" ]] && detected="$EMUDECK_DEFAULT_BASE"
+    fi
+
+    echo
+    FRONTEND_BASE="$(prompt "EmuDeck Emulation directory" "$detected")"
+    FRONTEND_BASE="${FRONTEND_BASE%/}"
+
+    if [[ ! -d "$FRONTEND_BASE" ]]; then
+        warn "Path does not exist yet: $FRONTEND_BASE"
+        if ! prompt_yn "Continue anyway? (Syncthing will create it on first sync)" "y"; then
+            fatal "Cancelled."
+        fi
+    fi
+    success "Using EmuDeck base: $FRONTEND_BASE"
 }
 
 # Detect the user-data root for RetroDECK by:
@@ -1859,6 +1934,23 @@ build_sync_scope_definitions() {
         return 0
     fi
 
+    if [[ "$FRONTEND" == "emudeck" ]]; then
+        # EmuDeck uses the identical Emulation/ layout on Linux and Windows, so
+        # the whole saves/ tree syncs cross-OS as ONE folder. The "ed-saves"
+        # key is shared between EmuDeck-Linux and EmuDeck-Windows (both scripts
+        # use it), so an EmuDeck PC and an EmuDeck Steam Deck share the same
+        # Syncthing folder and their saves sync straight across. roms/bios stay
+        # bare (shared with every frontend). storage/ (installed games, scraped
+        # media) is intentionally left out for now — it mixes huge device-
+        # specific data with art, so use custom mode if you want parts of it.
+        SYNC_SCOPE_DEFINITIONS=(
+            "roms|ROMs|${ED_ROMS_SUB}|roms"
+            "bios|BIOS|${ED_BIOS_SUB}|bios"
+            "ed-saves|Saves + states (EmuDeck - all emulators, cross-OS)|${ED_SAVES_SUB}|saves/emudeck"
+        )
+        return 0
+    fi
+
     SYNC_SCOPE_DEFINITIONS=(
         "roms|ROMs|${RD_ROMS_SUB}|roms"
         "bios|BIOS|${RD_BIOS_SUB}|bios"
@@ -1912,8 +2004,13 @@ step_sync_scope() {
         fi
     done
 
-    if prompt_yn "  Saves (per-emulator)" "y"; then
-        SAVES_SELECTED=1
+    # The per-emulator saves picker only applies to RetroDECK (its saves live
+    # in many per-emulator folders). EmuDeck syncs its whole saves/ tree via
+    # the ed-saves scope above, so it never needs this question.
+    if [[ "$FRONTEND" == "retrodeck" ]]; then
+        if prompt_yn "  Saves (per-emulator)" "y"; then
+            SAVES_SELECTED=1
+        fi
     fi
 }
 
@@ -3051,7 +3148,10 @@ step_apply_all() {
         local versioning="false"
         # Save states get versioning. Match anything containing "states"
         # so the prefixed keys (rd-states, rb-retroarch-states) still work.
+        # EmuDeck's ed-saves bundles saves AND states in one tree, so version
+        # it too (lets you roll back a corrupted save from the NAS).
         [[ "$key" == *"states"* ]] && versioning="true"
+        [[ "$key" == "ed-saves" ]] && versioning="true"
 
         # Build the .stignore lines for this folder (raw-lines channel).
         local fid
